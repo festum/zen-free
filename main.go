@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -472,7 +473,26 @@ func envOr(name, fallback string) string {
 	return fallback
 }
 
+func envSeconds(name string, fallback time.Duration) time.Duration {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback
+	}
+	seconds, err := strconv.Atoi(value)
+	if err != nil || seconds <= 0 {
+		log.Printf("invalid %s=%q, keeping %s", name, value, fallback)
+		return fallback
+	}
+	return time.Duration(seconds) * time.Second
+}
+
 func main() {
+	retryLoopBudget = envSeconds("ZEN_RETRY_BUDGET", retryLoopBudget)
+	if responseHeaderTimeout < retryLoopBudget {
+		responseHeaderTimeout = retryLoopBudget
+	}
+	log.Printf("retry budget=%s response header timeout=%s", retryLoopBudget, responseHeaderTimeout)
+
 	mint := &idMint{}
 	client := newUpstreamClient()
 	server := &http.Server{

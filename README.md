@@ -14,7 +14,11 @@ headers, four-tool block) and the tool padding the gist left to the caller.
 
 The listener binds `0.0.0.0:8801` and the port is overridable with `ZEN_PORT`. The
 upstream base URL comes from `ZEN_UPSTREAM` and defaults to
-`https://opencode.ai/zen`. The module is `github.com/festum/zen-free`, with no
+`https://opencode.ai/zen`. `ZEN_RETRY_BUDGET` sets the whole retry loop budget in
+seconds (default `120`): the upstream gets that long to answer before the proxy
+returns `502` with `upstream_interrupted`. The response header timeout follows the
+budget, so a value above `90` also raises it. Invalid or missing values fall back
+to the default. The module is `github.com/festum/zen-free`, with no
 third-party dependencies. Build it with `go build .` or the included Dockerfile.
 
 ## Usage

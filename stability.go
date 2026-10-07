@@ -13,7 +13,7 @@ import (
 var (
 	dialTimeout             = 15 * time.Second
 	tlsHandshakeTimeout     = 10 * time.Second
-	responseHeaderTimeout   = 60 * time.Second
+	responseHeaderTimeout   = 90 * time.Second
 	idleConnTimeout         = 90 * time.Second
 	expectContinueTimeout   = 1 * time.Second
 	maxIdleConns            = 32
@@ -23,7 +23,7 @@ var (
 	maxAttempts             = 3
 	retryBackoffs           = []time.Duration{1 * time.Second, 2 * time.Second}
 	retryAfterCap           = 5 * time.Second
-	retryLoopBudget         = 30 * time.Second
+	retryLoopBudget         = 120 * time.Second
 )
 
 const interruptedStreamPair = "data: {\"error\":{\"message\":\"oc-zen: upstream stream interrupted\",\"type\":\"upstream_interrupted\"}}\n\ndata: [DONE]\n\n"
