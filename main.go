@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -63,6 +64,12 @@ func (m *idMint) mint(prefix string) string {
 		id[len(prefix)+12+i] = base62[int(c)%len(base62)]
 	}
 	return string(id[:])
+}
+
+var sessionIDPattern = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
+
+func validSessionID(value string) bool {
+	return sessionIDPattern.MatchString(value)
 }
 
 func augmentChatTools(body map[string]any) bool {
@@ -194,14 +201,18 @@ func (f flushWriter) Write(p []byte) (int, error) {
 
 func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handler {
 	base := strings.TrimRight(upstream, "/")
+	apiKey := os.Getenv("OPENCODE_GO_API_KEY")
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
 		session, _ := r.Context().Value(contextKey{}).(string)
 		if session == "" {
 			session = r.Header.Get("x-opencode-session")
-		}
-		if session == "" {
-			session = mint.mint("ses_")
+			if session == "" {
+				session = r.Header.Get("x-opencode-session-id")
+			}
+			if !validSessionID(session) {
+				session = mint.mint("ses_")
+			}
 		}
 		requestID := mint.mint("msg_")
 		status, attempts := http.StatusBadGateway, 0
@@ -302,6 +313,10 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 		headers.Set("x-opencode-client", "desktop")
 		headers.Set("x-opencode-project", "global")
 		headers.Set("x-opencode-session", session)
+		headers.Set("x-opencode-session-id", session)
+		if apiKey != "" {
+			headers.Set("Authorization", "Bearer "+apiKey)
+		}
 		headers.Set("x-opencode-request", requestID)
 		headers.Set("Accept-Encoding", "identity")
 		if r.Header.Get("Accept") == "" {
