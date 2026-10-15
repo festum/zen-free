@@ -225,8 +225,9 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 			status = http.StatusBadRequest
 			return
 		}
-		museChat, streaming, chatWire, responsesWire, clientStream := false, false, false, false, false
+		museChat, streaming, chatWire, responsesWire, clientStream, responsesToChat, nativeFallback := false, false, false, false, false, false, false
 		requestedModel := ""
+		var nativeResponses []byte
 		if decoded {
 			requestedModel, _ = requestBody["model"].(string)
 			streaming, _ = requestBody["stream"].(bool)
@@ -242,6 +243,7 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 				}
 				toolsChanged := augmentFlatTools(requestBody)
 				choiceChanged := sanitizeResponsesToolChoice(requestBody)
+				nativeResponsesBody := original
 				if forcedStream || toolsChanged || choiceChanged {
 					updated, marshalErr := json.Marshal(requestBody)
 					if marshalErr != nil {
@@ -249,9 +251,21 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 						status = http.StatusBadRequest
 						return
 					}
-					setRequestBody(r, updated)
-				} else {
-					setRequestBody(r, original)
+					nativeResponsesBody = updated
+				}
+				setRequestBody(r, nativeResponsesBody)
+				if !isMuseModel(requestedModel) {
+					chatBody := buildChatCompletionsRequest(requestBody)
+					chatBody["stream"] = true
+					converted, marshalErr := json.Marshal(chatBody)
+					if marshalErr != nil {
+						http.Error(w, "invalid request body", http.StatusBadRequest)
+						status = http.StatusBadRequest
+						return
+					}
+					setRequestBody(r, converted)
+					responsesToChat = true
+					nativeResponses = nativeResponsesBody
 				}
 			}
 		case strings.Contains(r.URL.Path, "/v1/chat/completions") && isMuseModel(requestedModel):
@@ -292,6 +306,11 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 		requestURI := r.URL.RequestURI()
 		if museChat {
 			requestURI = "/v1/responses"
+			if r.URL.RawQuery != "" {
+				requestURI += "?" + r.URL.RawQuery
+			}
+		} else if responsesToChat {
+			requestURI = "/v1/chat/completions"
 			if r.URL.RawQuery != "" {
 				requestURI += "?" + r.URL.RawQuery
 			}
@@ -371,6 +390,29 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 				break
 			}
 			stripHopHeaders(resp.Header)
+			if responsesToChat && !nativeFallback && resp.StatusCode == http.StatusBadRequest {
+				fallbackBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+				_ = resp.Body.Close()
+				cancelAttempt()
+				if readErr == nil && bytes.Contains(fallbackBody, []byte("ModelProtocolUnsupported")) {
+					nativeFallback = true
+					responsesToChat = false
+					responsesWire = true
+					bodyBytes = nativeResponses
+					contentLength = int64(len(nativeResponses))
+					target = base + "/v1/responses"
+					if r.URL.RawQuery != "" {
+						target += "?" + r.URL.RawQuery
+					}
+					retryLog(attempt, "protocol_fallback", session)
+					continue
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write(fallbackBody)
+				status = http.StatusBadRequest
+				return
+			}
 			if museChat && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				if streaming {
 					w.Header().Set("Content-Type", "text/event-stream")
@@ -402,6 +444,44 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 				return
 			}
 			isSSE := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
+			if responsesToChat && resp.StatusCode >= 200 && resp.StatusCode < 300 && isSSE {
+				if streaming {
+					w.Header().Set("Content-Type", "text/event-stream")
+					w.Header().Set("Cache-Control", "no-cache")
+					writer := newSerializedStreamWriter(w, clientKeepAliveInterval)
+					resp.Body = watchUpstreamBody(resp.Body, upstreamIdleTimeout, session)
+					attemptStatus, retryable := writeChatStreamAsResponses(writer, resp.Body, requestedModel)
+					_ = resp.Body.Close()
+					cancelAttempt()
+					writer.Close()
+					status = attemptStatus
+					if retryable && attempt < maxAttempts && r.Context().Err() == nil && waitRetry(loopCtx, retryDelay(attempt, nil, 0)) {
+						retryLog(attempt, "stream_before_content", session)
+						continue
+					}
+					if retryable {
+						status = writeStreamInterrupted(w, true)
+					}
+					return
+				}
+				resp.Body = watchUpstreamBody(resp.Body, upstreamIdleTimeout, session)
+				completion, aggErr := aggregateChatStream(resp.Body, requestedModel)
+				_ = resp.Body.Close()
+				cancelAttempt()
+				if aggErr != nil {
+					if errors.Is(aggErr, errEmptyChatStream) && attempt < maxAttempts && r.Context().Err() == nil && waitRetry(loopCtx, retryDelay(attempt, nil, 0)) {
+						retryLog(attempt, "empty_chat_stream", session)
+						continue
+					}
+					status = writeJSONError(w, aggErr.Error())
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(chatCompletionToResponse(completion))
+				status = http.StatusOK
+				return
+			}
 			if chatWire && !clientStream && isSSE && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				resp.Body = watchUpstreamBody(resp.Body, upstreamIdleTimeout, session)
 				completion, aggErr := aggregateChatStream(resp.Body, requestedModel)

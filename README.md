@@ -76,6 +76,10 @@ Add it the way you add any other OpenAI-compatible provider:
 Note below explains. `GET /v1/models` lists the free catalog without a key; after
 that, call `chat/completions` as usual. `muse-spark-*` requests are converted to the
 Responses wire in flight.
+`POST /v1/responses` on a non-`muse-spark-*` model is converted to the chat wire in
+flight and the result is converted back to Responses shape; if the upstream rejects
+the chat wire with `400 ModelProtocolUnsupported`, the proxy retries once on the
+native `/v1/responses` path.
 
 ### OpenCode Go
 
