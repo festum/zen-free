@@ -677,7 +677,7 @@ func main() {
 	client := newUpstreamClient()
 	server := &http.Server{
 		Addr:    "0.0.0.0:" + envOr("ZEN_PORT", "8801"),
-		Handler: proxyHandler(envOr("ZEN_UPSTREAM", "https://opencode.ai/zen"), client, mint),
+		Handler: proxyHandler(envOr("ZEN_UPSTREAM", "https://opencode.ai/inference"), client, mint),
 		ConnContext: func(ctx context.Context, _ net.Conn) context.Context {
 			session := mint.mint("ses_")
 			log.Printf("new-conn ses=%s", session)
