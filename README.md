@@ -26,12 +26,16 @@ tools when the caller supplies no tools. Caller tool lists are preserved unchang
 The upstream serves a free-tier request only when the body carries
 `"stream": true` and a tool named exactly `read`; `stream: false` returns
 `403 FreeTierError` whatever the headers say, and arbitrary tool definitions
-do not satisfy the gate on their own. This proxy forces `stream: true` upstream
-and injects the captured OpenCode `bash`, `edit`, `glob`, `grep`, `read`, and
-`write` tools only when the caller provides no tools. For Chat Completions, the proxy
-defaults `tool_choice` to `"none"` only when the caller did not supply a choice;
-Responses requests leave the choice unpinned. Injected calls are removed from responses, while calls to
-caller-supplied tools remain available.
+do not satisfy the gate on their own. This proxy forces `stream: true` upstream.
+For upstream URLs under the `/inference` path family, it replaces caller
+definitions named `bash`, `edit`, `glob`, `grep`, `read`, or `write` with the
+captured OpenCode definitions, preserves arbitrary tools, and adds missing
+gate-required `bash`, `glob`, `grep`, and `read` tools. Empty tool lists retain
+the existing six-tool injection behavior. Outside `/inference`, tool handling
+retains its existing behavior. For Chat Completions, the proxy defaults
+`tool_choice` to `"none"` only when the caller did not supply tools or a choice;
+Responses requests leave the choice unpinned. Calls to proxy-managed core tools
+are removed from responses, while calls to arbitrary caller tools remain available.
 
 ## Run
 

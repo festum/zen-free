@@ -281,6 +281,66 @@ func TestProxyHandlerToolAugmentationAndChoicePreservation(t *testing.T) {
 	}
 }
 
+func TestProxyHandlerInferenceNormalizationPreservesWireFormats(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		upstreamPath string
+		path         string
+		body         string
+		wantNested   bool
+		wantNames    []string
+		wantChoice   any
+	}{
+		{name: "inference OpenAI Chat", upstreamPath: "/inference/openai", path: "/v1/chat/completions", body: `{"model":"gpt-4o","messages":[],"tool_choice":"required","tools":[{"type":"function","function":{"name":"bash","parameters":{"type":"string"}}},{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`, wantNested: true, wantNames: []string{"bash", "lookup", "glob", "grep", "read"}, wantChoice: "required"},
+		{name: "inference Anthropic Responses", upstreamPath: "/inference/anthropic", path: "/v1/responses", body: `{"model":"muse-spark-1.3","input":"hi","tools":[{"type":"function","name":"bash","parameters":{"type":"string"}},{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":"required"}`, wantNames: []string{"bash", "lookup", "glob", "grep", "read"}, wantChoice: "required"},
+		{name: "inference Google Chat", upstreamPath: "/inference/google", path: "/v1/chat/completions", body: `{"model":"gpt-4o","messages":[],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`, wantNested: true, wantNames: []string{"lookup", "bash", "glob", "grep", "read"}},
+		{name: "legacy upstream keeps client tools", upstreamPath: "/zen/v1", path: "/zen/v1/chat/completions", body: `{"model":"gpt-4o","messages":[],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`, wantNested: true, wantNames: []string{"lookup"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var upstreamBody map[string]any
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				payload, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Error(err)
+				}
+				upstreamBody = decodeJSON(t, payload)
+				if strings.Contains(r.URL.Path, "responses") {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, sampleResponsesSSE(t))
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{}`)
+			}))
+			defer upstream.Close()
+			request := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Accept", "text/event-stream")
+			w := httptest.NewRecorder()
+			proxyHandler(upstream.URL+tt.upstreamPath, upstream.Client(), &idMint{}).ServeHTTP(w, request)
+			if w.Code != http.StatusOK {
+				t.Fatalf("proxy response = %d %q", w.Code, w.Body.String())
+			}
+			tools := array(t, upstreamBody["tools"])
+			if len(tools) != len(tt.wantNames) {
+				t.Fatalf("upstream tools count = %d, want %d (%#v)", len(tools), len(tt.wantNames), tools)
+			}
+			for i, value := range tools {
+				tool := object(t, value)
+				if tt.wantNested {
+					tool = object(t, tool["function"])
+				}
+				if tool["name"] != tt.wantNames[i] {
+					t.Errorf("tool %d name = %#v, want %q", i, tool["name"], tt.wantNames[i])
+				}
+			}
+			if upstreamBody["tool_choice"] != tt.wantChoice {
+				t.Errorf("tool_choice = %#v, want %#v", upstreamBody["tool_choice"], tt.wantChoice)
+			}
+		})
+	}
+}
+
 func TestBuildResponsesRequestRepairsToolPairing(t *testing.T) {
 	chat := map[string]any{"model": "muse-spark", "messages": []any{
 		map[string]any{"role": "user", "content": "start"},
@@ -790,6 +850,81 @@ func TestProxyHandlerInjectedToolCallsAreFiltered(t *testing.T) {
 			t.Fatalf("caller tool call = %#v, want caller-supplied bash", function)
 		}
 	})
+
+	t.Run("normalized core call is filtered", func(t *testing.T) {
+		setStabilityTestKnobs(t)
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"core\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}},{\"index\":1,\"id\":\"custom\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}\n\n")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		}))
+		defer upstream.Close()
+		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4o","stream":false,"messages":[],"tools":[{"type":"function","function":{"name":"bash","parameters":{"type":"object"}}},{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`))
+		request.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		proxyHandler(upstream.URL+"/inference/openai", upstream.Client(), &idMint{}).ServeHTTP(w, request)
+		completion := decodeJSON(t, w.Body.Bytes())
+		choice := object(t, array(t, completion["choices"])[0])
+		calls := array(t, object(t, choice["message"])["tool_calls"])
+		if len(calls) != 1 {
+			t.Fatalf("tool calls after normalized-core filtering = %#v, want only lookup", calls)
+		}
+		if name := stringValue(object(t, object(t, calls[0])["function"])["name"]); name != "lookup" {
+			t.Fatalf("remaining tool call = %q, want lookup", name)
+		}
+	})
+}
+
+func TestProxyHandlerFiltersNormalizedResponsesCoreCalls(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_norm\",\"created_at\":123,\"output\":[]}}\n\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_norm\",\"created_at\":123,\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"id\":\"core\",\"call_id\":\"core\",\"name\":\"bash\",\"arguments\":\"{}\"},{\"type\":\"function_call\",\"id\":\"custom\",\"call_id\":\"custom\",\"name\":\"lookup\",\"arguments\":\"{}\"},{\"type\":\"message\",\"id\":\"msg\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}]}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"muse-spark-1.3","input":"run","stream":true,"tools":[{"type":"function","name":"bash","parameters":{"type":"string"}},{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "text/event-stream")
+	w := httptest.NewRecorder()
+	proxyHandler(upstream.URL+"/inference/anthropic", upstream.Client(), &idMint{}).ServeHTTP(w, request)
+	if w.Code != http.StatusOK {
+		t.Fatalf("proxy response = %d %q", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), `"name":"bash"`) {
+		t.Fatalf("normalized Responses core call leaked: %q", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"name":"lookup"`) {
+		t.Fatalf("arbitrary Responses call was removed: %q", w.Body.String())
+	}
+}
+
+func TestProxyHandlerFiltersNormalizedResponsesFallbackCalls(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/v1/chat/completions") {
+			t.Errorf("upstream path = %q, want suffix /v1/chat/completions", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"core\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}},{\"index\":1,\"id\":\"custom\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-4o","input":"run","stream":true,"tools":[{"type":"function","name":"bash","parameters":{"type":"string"}},{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "text/event-stream")
+	w := httptest.NewRecorder()
+	proxyHandler(upstream.URL+"/inference/openai", upstream.Client(), &idMint{}).ServeHTTP(w, request)
+	if w.Code != http.StatusOK {
+		t.Fatalf("proxy response = %d %q", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), `"name":"bash"`) {
+		t.Fatalf("normalized Responses fallback core call leaked: %q", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"name":"lookup"`) {
+		t.Fatalf("arbitrary Responses fallback call was removed: %q", w.Body.String())
+	}
 }
 func TestFilterToolCallsInJSON(t *testing.T) {
 	for _, injectedName := range []string{"bash", "edit", "glob", "grep", "read", "write"} {

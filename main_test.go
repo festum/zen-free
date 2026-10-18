@@ -52,9 +52,9 @@ func TestCapturedOpenCodeToolSchemasMatchChatAndResponsesWires(t *testing.T) {
 		t.Fatalf("captured tool count = %d, want 6", len(capturedOpenCodeTools))
 	}
 	chatBody := map[string]any{}
-	chatInjected := augmentChatTools(chatBody)
+	chatInjected := augmentChatTools(chatBody, false)
 	responsesBody := map[string]any{}
-	responsesInjected := augmentFlatTools(responsesBody)
+	responsesInjected := augmentFlatTools(responsesBody, false)
 	chatTools := chatBody["tools"].([]any)
 	responsesTools := responsesBody["tools"].([]any)
 	if len(chatTools) != len(capturedOpenCodeTools) || len(responsesTools) != len(capturedOpenCodeTools) {
@@ -89,5 +89,109 @@ func TestCapturedOpenCodeToolSchemasMatchChatAndResponsesWires(t *testing.T) {
 		if !chatInjected[name] || !responsesInjected[name] {
 			t.Fatalf("tool %q missing from injection filter", name)
 		}
+	}
+}
+
+func TestInferencePathRecognizesExactSegments(t *testing.T) {
+	tests := []struct {
+		upstream string
+		want     bool
+	}{
+		{upstream: "https://opencode.ai/inference", want: true},
+		{upstream: "https://opencode.ai/inference/openai", want: true},
+		{upstream: "https://opencode.ai/inference/anthropic", want: true},
+		{upstream: "https://opencode.ai/inference/google", want: true},
+		{upstream: "https://opencode.ai/zen/v1", want: false},
+		{upstream: "https://opencode.ai/not-inference/openai", want: false},
+	}
+	for _, tt := range tests {
+		if got := inferencePath(tt.upstream); got != tt.want {
+			t.Errorf("inferencePath(%q) = %t, want %t", tt.upstream, got, tt.want)
+		}
+	}
+}
+
+func TestNormalizeCapturedCoreToolsPreservesCallerTools(t *testing.T) {
+	for _, nested := range []bool{true, false} {
+		name := "Responses"
+		tools := []any{
+			map[string]any{"type": "function", "name": "lookup", "parameters": map[string]any{"type": "object"}},
+			map[string]any{"type": "function", "name": "bash", "parameters": map[string]any{"type": "string"}},
+			map[string]any{"type": "function", "name": "write", "parameters": map[string]any{"type": "string"}},
+		}
+		if nested {
+			name = "Chat"
+			for _, tool := range tools {
+				flat := tool.(map[string]any)
+				function := make(map[string]any, len(flat)-1)
+				for key, value := range flat {
+					if key != "type" {
+						function[key] = value
+					}
+				}
+				flat["function"] = function
+				delete(flat, "name")
+				delete(flat, "parameters")
+			}
+		}
+		t.Run(name, func(t *testing.T) {
+			body := map[string]any{"tools": tools}
+			var filter map[string]bool
+			if nested {
+				filter = augmentChatTools(body, true)
+			} else {
+				filter = augmentFlatTools(body, true)
+			}
+			got := array(t, body["tools"])
+			wantNames := []string{"lookup", "bash", "write", "glob", "grep", "read"}
+			if len(got) != len(wantNames) {
+				t.Fatalf("normalized tools count = %d, want %d", len(got), len(wantNames))
+			}
+			for i, value := range got {
+				tool := object(t, value)
+				if nested {
+					tool = object(t, tool["function"])
+				}
+				if tool["name"] != wantNames[i] {
+					t.Errorf("tool %d name = %#v, want %q", i, tool["name"], wantNames[i])
+				}
+				if wantNames[i] != "lookup" {
+					for _, captured := range capturedOpenCodeTools {
+						function := object(t, object(t, captured)["function"])
+						if function["name"] != wantNames[i] {
+							continue
+						}
+						want, err := json.Marshal(function)
+						if err != nil {
+							t.Fatal(err)
+						}
+						gotSchemaValue := tool
+						if !nested {
+							gotSchemaValue = make(map[string]any, len(tool)-1)
+							for key, value := range tool {
+								if key != "type" {
+									gotSchemaValue[key] = value
+								}
+							}
+						}
+						gotSchema, err := json.Marshal(gotSchemaValue)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if string(gotSchema) != string(want) {
+							t.Errorf("tool %q does not match captured definition", wantNames[i])
+						}
+					}
+				}
+			}
+			for _, core := range []string{"bash", "glob", "grep", "read", "write"} {
+				if !filter[core] {
+					t.Errorf("filter does not hide normalized core tool %q", core)
+				}
+			}
+			if filter["lookup"] {
+				t.Error("filter hides arbitrary caller tool lookup")
+			}
+		})
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -108,41 +109,99 @@ func cloneToolValue(value any) any {
 	}
 }
 
-func augmentChatTools(body map[string]any) map[string]bool {
-	tools, _ := body["tools"].([]any)
-	if len(tools) > 0 {
-		return nil
+func inferencePath(upstream string) bool {
+	parsed, err := url.Parse(upstream)
+	if err != nil {
+		return false
 	}
-	tools = make([]any, len(capturedOpenCodeTools))
-	injected := make(map[string]bool, len(capturedOpenCodeTools))
-	for i, raw := range capturedOpenCodeTools {
-		tools[i] = cloneToolValue(raw)
-		injected[toolName(tools[i].(map[string]any))] = true
+	for _, segment := range strings.Split(strings.Trim(parsed.Path, "/"), "/") {
+		if segment == "inference" {
+			return true
+		}
 	}
-	body["tools"] = tools
-	return injected
+	return false
 }
 
-func augmentFlatTools(body map[string]any) map[string]bool {
-	tools, _ := body["tools"].([]any)
-	if len(tools) > 0 {
-		return nil
-	}
-	flatTools := make([]any, len(capturedOpenCodeTools))
-	injected := make(map[string]bool, len(capturedOpenCodeTools))
-	for i, raw := range capturedOpenCodeTools {
-		tool := cloneToolValue(raw).(map[string]any)
+func capturedTool(name string, nested bool) map[string]any {
+	for _, raw := range capturedOpenCodeTools {
+		tool := raw.(map[string]any)
 		function := tool["function"].(map[string]any)
-		flat := make(map[string]any, len(function)+1)
-		flat["type"] = "function"
-		for key, value := range function {
+		if function["name"] != name {
+			continue
+		}
+		if nested {
+			return cloneToolValue(tool).(map[string]any)
+		}
+		flat := map[string]any{"type": "function"}
+		for key, value := range cloneToolValue(function).(map[string]any) {
 			flat[key] = value
 		}
-		flatTools[i] = flat
-		injected[stringValue(function["name"])] = true
+		return flat
 	}
-	body["tools"] = flatTools
-	return injected
+	return nil
+}
+
+func augmentTools(body map[string]any, nested, normalize bool) map[string]bool {
+	tools, _ := body["tools"].([]any)
+	if !normalize || len(tools) == 0 {
+		if len(tools) > 0 {
+			return nil
+		}
+		injected := make(map[string]bool, len(capturedOpenCodeTools))
+		if nested {
+			tools = make([]any, len(capturedOpenCodeTools))
+			for i, raw := range capturedOpenCodeTools {
+				tools[i] = cloneToolValue(raw)
+				injected[toolName(tools[i].(map[string]any))] = true
+			}
+		} else {
+			tools = make([]any, len(capturedOpenCodeTools))
+			for i, raw := range capturedOpenCodeTools {
+				function := raw.(map[string]any)["function"].(map[string]any)
+				tools[i] = capturedTool(stringValue(function["name"]), false)
+				injected[stringValue(function["name"])] = true
+			}
+		}
+		body["tools"] = tools
+		return injected
+	}
+
+	coreNames := make(map[string]bool, len(capturedOpenCodeTools))
+	for _, raw := range capturedOpenCodeTools {
+		coreNames[toolName(raw.(map[string]any))] = true
+	}
+	filter := make(map[string]bool, len(coreNames))
+	seenRequired := make(map[string]bool, 4)
+	for i, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := toolName(tool)
+		if !coreNames[name] {
+			continue
+		}
+		tools[i] = capturedTool(name, nested)
+		filter[name] = true
+		seenRequired[name] = true
+	}
+	for _, name := range []string{"bash", "glob", "grep", "read"} {
+		if seenRequired[name] {
+			continue
+		}
+		tools = append(tools, capturedTool(name, nested))
+		filter[name] = true
+	}
+	body["tools"] = tools
+	return filter
+}
+
+func augmentChatTools(body map[string]any, normalize bool) map[string]bool {
+	return augmentTools(body, true, normalize)
+}
+
+func augmentFlatTools(body map[string]any, normalize bool) map[string]bool {
+	return augmentTools(body, false, normalize)
 }
 
 type toolCallFilter struct {
@@ -231,6 +290,7 @@ func proxyHandlerWithRelay(upstream string, client *http.Client, mint *idMint, r
 		egressClient = &relayClient
 	}
 	apiKey := os.Getenv("OPENCODE_GO_API_KEY")
+	inference := inferencePath(upstream)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if relay.err != nil {
 			http.Error(w, relay.err.Error(), http.StatusInternalServerError)
@@ -276,7 +336,7 @@ func proxyHandlerWithRelay(upstream string, client *http.Client, mint *idMint, r
 				if forcedStream {
 					requestBody["stream"] = true
 				}
-				injectedTools = augmentFlatTools(requestBody)
+				injectedTools = augmentFlatTools(requestBody, inference)
 				toolFilter = requestToolFilter(injectedTools)
 				nativeResponsesBody := original
 				if forcedStream || len(injectedTools) > 0 {
@@ -306,7 +366,7 @@ func proxyHandlerWithRelay(upstream string, client *http.Client, mint *idMint, r
 		case strings.Contains(r.URL.Path, "/v1/chat/completions") && isMuseModel(requestedModel):
 			museChat = true
 			callerTools, _ := requestBody["tools"].([]any)
-			injectedTools = augmentChatTools(requestBody)
+			injectedTools = augmentChatTools(requestBody, inference)
 			toolFilter = requestToolFilter(injectedTools)
 			if len(callerTools) == 0 {
 				if _, choiceProvided := requestBody["tool_choice"]; !choiceProvided {
@@ -329,7 +389,7 @@ func proxyHandlerWithRelay(upstream string, client *http.Client, mint *idMint, r
 		default:
 			if decoded {
 				callerTools, _ := requestBody["tools"].([]any)
-				injectedTools = augmentChatTools(requestBody)
+				injectedTools = augmentChatTools(requestBody, inference)
 				if strings.Contains(r.URL.Path, "/v1/chat/completions") && len(callerTools) == 0 {
 					if _, choiceProvided := requestBody["tool_choice"]; !choiceProvided {
 						requestBody["tool_choice"] = "none"
