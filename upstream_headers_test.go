@@ -65,10 +65,12 @@ func TestUpstreamSessionHeadersPaired(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var gotSession, gotSessionID string
+			var gotSession, gotSessionID, gotAffinity, gotProject string
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				gotSession = r.Header.Get("x-opencode-session")
 				gotSessionID = r.Header.Get("x-opencode-session-id")
+				gotAffinity = r.Header.Get("x-session-affinity")
+				gotProject = r.Header.Get("x-opencode-project")
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = io.WriteString(w, `{"object":"list"}`)
 			}))
@@ -87,8 +89,14 @@ func TestUpstreamSessionHeadersPaired(t *testing.T) {
 			if recorder.Code != http.StatusOK {
 				t.Fatalf("client status = %d body %q", recorder.Code, recorder.Body.String())
 			}
-			if gotSession == "" || gotSession != gotSessionID {
-				t.Fatalf("upstream session pair = (%q, %q), want equal non-empty values", gotSession, gotSessionID)
+			if gotSession == "" || gotSession != gotSessionID || gotSession != gotAffinity {
+				t.Fatalf("upstream session affinity headers = (%q, %q, %q), want equal non-empty values", gotSession, gotSessionID, gotAffinity)
+			}
+			if len(gotProject) != 40 || strings.Trim(gotProject, "0123456789abcdef") != "" {
+				t.Fatalf("upstream project ID = %q, want 40 lowercase hexadecimal characters", gotProject)
+			}
+			if gotProject != opencodeProjectID {
+				t.Fatalf("upstream project ID = %q, want process ID %q", gotProject, opencodeProjectID)
 			}
 			if tt.wantSession != "" && gotSession != tt.wantSession {
 				t.Fatalf("upstream session = %q, want %q", gotSession, tt.wantSession)

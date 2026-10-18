@@ -215,24 +215,37 @@ func (e *responsesEventWriter) emit(eventType string, payload map[string]any) er
 	return nil
 }
 
+type pendingResponseTool struct {
+	call             *responseToolCall
+	item             map[string]any
+	name             strings.Builder
+	arguments        strings.Builder
+	emitted          bool
+	emittedArguments int
+}
+
 type responsesStreamState struct {
-	writer     *responsesEventWriter
-	responseID string
-	created    int64
-	model      string
-	output     []any
-	messageID  string
-	msgIndex   int
-	msgOpen    bool
-	text       strings.Builder
-	toolCalls  []*responseToolCall
-	toolItems  []map[string]any
-	toolIndex  map[int]int
-	usage      map[string]any
-	finish     string
-	failure    string
-	sawEvent   bool
-	terminal   bool
+	writer          *responsesEventWriter
+	responseID      string
+	created         int64
+	model           string
+	output          []any
+	messageID       string
+	msgIndex        int
+	msgOpen         bool
+	text            strings.Builder
+	toolCalls       []*responseToolCall
+	toolItems       []map[string]any
+	toolIndex       map[int]int
+	toolOutputIndex []int
+	hiddenTools     map[int]bool
+	pendingOrder    []int
+	pendingTools    map[int]*pendingResponseTool
+	usage           map[string]any
+	finish          string
+	failure         string
+	sawEvent        bool
+	terminal        bool
 }
 
 func (s *responsesStreamState) snapshot(status string, incomplete bool) map[string]any {
@@ -268,29 +281,82 @@ func (s *responsesStreamState) ensureMessage() error {
 	return s.writer.emit("response.content_part.added", map[string]any{"item_id": s.messageID, "output_index": s.msgIndex, "content_index": 0, "part": map[string]any{"type": "output_text", "text": ""}})
 }
 
-func (s *responsesStreamState) ensureTool(chunk map[string]any) (int, error) {
-	slot := 0
+func responseToolSlot(chunk map[string]any) int {
 	if value, ok := chunk["index"].(float64); ok && int(value) > 0 {
-		slot = int(value)
+		return int(value)
 	}
-	if index, ok := s.toolIndex[slot]; ok {
-		return index, nil
+	return 0
+}
+
+func (s *responsesStreamState) appendToolChunk(chunk map[string]any) {
+	slot := responseToolSlot(chunk)
+	if s.hiddenTools[slot] {
+		return
 	}
-	call := &responseToolCall{ID: stringValue(chunk["id"]), Type: "function"}
-	if function, ok := chunk["function"].(map[string]any); ok {
-		call.Function.Name = stringValue(function["name"])
+	pending := s.pendingTools[slot]
+	if pending == nil {
+		pending = &pendingResponseTool{call: &responseToolCall{Type: "function"}, item: map[string]any{"type": "function_call", "id": mintItemID("fc_"), "call_id": "", "name": "", "arguments": "", "status": "in_progress"}}
+		s.pendingTools[slot] = pending
+		s.pendingOrder = append(s.pendingOrder, slot)
 	}
-	index := len(s.toolCalls)
-	s.toolCalls = append(s.toolCalls, call)
-	s.toolIndex[slot] = index
-	item := map[string]any{"type": "function_call", "id": mintItemID("fc_"), "call_id": call.ID, "name": call.Function.Name, "arguments": "", "status": "in_progress"}
-	s.toolItems = append(s.toolItems, item)
-	outputIndex := len(s.output)
-	s.output = append(s.output, item)
-	if err := s.writer.emit("response.output_item.added", map[string]any{"item": item, "output_index": outputIndex}); err != nil {
-		return index, err
+	if id := stringValue(chunk["id"]); id != "" {
+		pending.call.ID = id
+		pending.item["call_id"] = id
 	}
-	return index, nil
+	function, _ := chunk["function"].(map[string]any)
+	pending.name.WriteString(stringValue(function["name"]))
+	pending.arguments.WriteString(stringValue(function["arguments"]))
+}
+
+func (s *responsesStreamState) flushPendingTools(filter toolCallFilter, final bool) error {
+	for _, slot := range s.pendingOrder {
+		pending := s.pendingTools[slot]
+		if pending == nil {
+			continue
+		}
+		name := pending.name.String()
+		if filter.hides(name) {
+			s.hiddenTools[slot] = true
+			delete(s.pendingTools, slot)
+			continue
+		}
+		if !pending.emitted {
+			possibleInjectedName := false
+			for injectedName := range filter.injected {
+				if strings.HasPrefix(injectedName, name) {
+					possibleInjectedName = true
+					break
+				}
+			}
+			if name == "" || possibleInjectedName && !final {
+				continue
+			}
+			pending.call.Function.Name = name
+			index := len(s.toolCalls)
+			s.toolIndex[slot] = index
+			s.toolCalls = append(s.toolCalls, pending.call)
+			s.toolItems = append(s.toolItems, pending.item)
+			outputIndex := len(s.output)
+			s.toolOutputIndex = append(s.toolOutputIndex, outputIndex)
+			s.output = append(s.output, pending.item)
+			pending.emitted = true
+			pending.item["name"] = name
+			pending.item["arguments"] = ""
+			if err := s.writer.emit("response.output_item.added", map[string]any{"item": pending.item, "output_index": outputIndex}); err != nil {
+				return err
+			}
+		}
+		pending.call.Function.Arguments = pending.arguments.String()
+		pending.item["arguments"] = pending.call.Function.Arguments
+		if pending.emittedArguments < pending.arguments.Len() {
+			delta := pending.arguments.String()[pending.emittedArguments:]
+			pending.emittedArguments = pending.arguments.Len()
+			if err := s.writer.emit("response.function_call_arguments.delta", map[string]any{"item_id": pending.item["id"], "output_index": s.toolOutputIndex[s.toolIndex[slot]], "call_id": pending.call.ID, "name": name, "delta": delta}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (s *responsesStreamState) finishStream() error {
@@ -312,7 +378,7 @@ func (s *responsesStreamState) finishStream() error {
 	}
 	for index := range s.toolCalls {
 		item := s.toolItems[index]
-		outputIndex := len(s.output) - len(s.toolItems) + index
+		outputIndex := s.toolOutputIndex[index]
 		if err := s.writer.emit("response.function_call_arguments.done", map[string]any{"item_id": item["id"], "output_index": outputIndex, "call_id": s.toolCalls[index].ID, "name": s.toolCalls[index].Function.Name, "arguments": s.toolCalls[index].Function.Arguments}); err != nil {
 			return err
 		}
@@ -328,17 +394,18 @@ func (s *responsesStreamState) finishStream() error {
 	return s.writer.emit("response.completed", map[string]any{"response": s.snapshot(status, incomplete)})
 }
 
-func writeChatStreamAsResponses(w http.ResponseWriter, body io.Reader, model string) (int, bool) {
+func writeChatStreamAsResponses(w http.ResponseWriter, body io.Reader, model string, filter toolCallFilter) (int, bool) {
 	if model == "" {
 		model = "unknown"
 	}
 	state := &responsesStreamState{
-		writer:     &responsesEventWriter{w: w},
-		responseID: mintRespID(),
-		created:    time.Now().Unix(),
-		model:      model,
-		output:     []any{},
-		toolIndex:  make(map[int]int),
+		writer:       &responsesEventWriter{w: w},
+		responseID:   mintRespID(),
+		created:      time.Now().Unix(),
+		model:        model,
+		toolIndex:    make(map[int]int),
+		hiddenTools:  make(map[int]bool),
+		pendingTools: make(map[int]*pendingResponseTool),
 	}
 	if err := state.writer.emit("response.created", map[string]any{"response": state.snapshot("in_progress", false)}); err != nil {
 		return http.StatusBadGateway, true
@@ -394,26 +461,12 @@ func writeChatStreamAsResponses(w http.ResponseWriter, body io.Reader, model str
 		if calls, ok := delta["tool_calls"].([]any); ok {
 			for _, rawCall := range calls {
 				call, ok := rawCall.(map[string]any)
-				if !ok {
-					continue
+				if ok {
+					state.appendToolChunk(call)
 				}
-				index, err := state.ensureTool(call)
-				if err != nil {
-					return err
-				}
-				arguments := ""
-				if function, ok := call["function"].(map[string]any); ok {
-					arguments = stringValue(function["arguments"])
-				}
-				if arguments == "" {
-					continue
-				}
-				state.toolCalls[index].Function.Arguments += arguments
-				item := state.toolItems[index]
-				outputIndex := len(state.output) - len(state.toolItems) + index
-				if err := state.writer.emit("response.function_call_arguments.delta", map[string]any{"item_id": item["id"], "output_index": outputIndex, "call_id": state.toolCalls[index].ID, "name": state.toolCalls[index].Function.Name, "delta": arguments}); err != nil {
-					return err
-				}
+			}
+			if err := state.flushPendingTools(filter, false); err != nil {
+				return err
 			}
 		}
 		if reason := stringValue(choice["finish_reason"]); reason != "" {
@@ -478,6 +531,9 @@ func writeChatStreamAsResponses(w http.ResponseWriter, body io.Reader, model str
 		if !state.sawEvent {
 			return http.StatusBadGateway, true
 		}
+		return writeStreamInterrupted(w, true), false
+	}
+	if err := state.flushPendingTools(filter, true); err != nil {
 		return writeStreamInterrupted(w, true), false
 	}
 	if err := state.finishStream(); err != nil {

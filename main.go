@@ -23,9 +23,17 @@ import (
 const base62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
 var opencodeVersion = "1.18.35"
+var opencodeProjectID = mintProjectID()
 
 var fingerprintUA = buildFingerprintUA()
 
+func mintProjectID() string {
+	var value [20]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		panic(fmt.Errorf("generate project id: %w", err))
+	}
+	return hex.EncodeToString(value[:])
+}
 func buildFingerprintUA() string {
 	return "opencode/" + opencodeVersion + " ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 }
@@ -72,76 +80,85 @@ func validSessionID(value string) bool {
 	return sessionIDPattern.MatchString(value)
 }
 
-func augmentChatTools(body map[string]any) bool {
-	tools, ok := body["tools"].([]any)
-	if _, exists := body["tools"]; exists && !ok {
-		return false
+func toolName(tool map[string]any) string {
+	if name, ok := tool["name"].(string); ok {
+		return name
 	}
-	if !ok {
-		tools = nil
-	}
-	present := make(map[string]bool)
-	for _, rawTool := range tools {
-		tool, ok := rawTool.(map[string]any)
-		if !ok {
-			continue
-		}
-		if name, ok := tool["name"].(string); ok {
-			present[strings.ToLower(name)] = true
-		}
-		if function, ok := tool["function"].(map[string]any); ok {
-			if name, ok := function["name"].(string); ok {
-				present[strings.ToLower(name)] = true
-			}
-		}
-	}
-	missing := false
-	for _, name := range []string{"bash", "glob", "grep", "read"} {
-		if present[name] {
-			continue
-		}
-		missing = true
-		tools = append(tools, map[string]any{"type": "function", "function": map[string]any{
-			"name": name, "description": quartetDescription,
-			"parameters": map[string]any{"type": "object", "properties": map[string]any{}},
-		}})
-	}
-	if !missing {
-		return false
-	}
-	if _, exists := body["tools"]; !exists {
-		if _, choiceExists := body["tool_choice"]; !choiceExists {
-			body["tool_choice"] = "none"
-		}
-	}
-	body["tools"] = tools
-	return true
+	function, _ := tool["function"].(map[string]any)
+	name, _ := function["name"].(string)
+	return name
 }
 
-func augmentFlatTools(body map[string]any) bool {
+func cloneToolValue(value any) any {
+	switch value := value.(type) {
+	case map[string]any:
+		cloned := make(map[string]any, len(value))
+		for key, child := range value {
+			cloned[key] = cloneToolValue(child)
+		}
+		return cloned
+	case []any:
+		cloned := make([]any, len(value))
+		for i, child := range value {
+			cloned[i] = cloneToolValue(child)
+		}
+		return cloned
+	default:
+		return value
+	}
+}
+
+func augmentChatTools(body map[string]any) map[string]bool {
 	tools, _ := body["tools"].([]any)
-	present := make(map[string]bool)
-	for _, rawTool := range tools {
-		tool, ok := rawTool.(map[string]any)
-		if !ok || tool["type"] != "function" {
-			continue
-		}
-		if name, ok := tool["name"].(string); ok {
-			present[strings.ToLower(name)] = true
-		}
+	if len(tools) > 0 {
+		return nil
 	}
-	missing := false
-	for _, name := range []string{"bash", "glob", "grep", "read"} {
-		if present[name] {
-			continue
+	tools = make([]any, len(capturedOpenCodeTools))
+	injected := make(map[string]bool, len(capturedOpenCodeTools))
+	for i, raw := range capturedOpenCodeTools {
+		tools[i] = cloneToolValue(raw)
+		injected[toolName(tools[i].(map[string]any))] = true
+	}
+	body["tools"] = tools
+	return injected
+}
+
+func augmentFlatTools(body map[string]any) map[string]bool {
+	tools, _ := body["tools"].([]any)
+	if len(tools) > 0 {
+		return nil
+	}
+	flatTools := make([]any, len(capturedOpenCodeTools))
+	injected := make(map[string]bool, len(capturedOpenCodeTools))
+	for i, raw := range capturedOpenCodeTools {
+		tool := cloneToolValue(raw).(map[string]any)
+		function := tool["function"].(map[string]any)
+		flat := make(map[string]any, len(function)+1)
+		flat["type"] = "function"
+		for key, value := range function {
+			flat[key] = value
 		}
-		missing = true
-		tools = append(tools, map[string]any{"type": "function", "name": name, "description": quartetDescription, "parameters": map[string]any{"type": "object", "properties": map[string]any{}}})
+		flatTools[i] = flat
+		injected[stringValue(function["name"])] = true
 	}
-	if missing {
-		body["tools"] = tools
-	}
-	return missing
+	body["tools"] = flatTools
+	return injected
+}
+
+type toolCallFilter struct {
+	injected map[string]bool
+}
+
+func (f toolCallFilter) hides(name string) bool {
+	return f.injected[name]
+}
+
+func (f toolCallFilter) enabled() bool {
+	return len(f.injected) > 0
+}
+
+func requestToolFilter(injected map[string]bool) toolCallFilter {
+	return toolCallFilter{injected: injected}
 }
 
 func setRequestBody(req *http.Request, body []byte) {
@@ -200,9 +217,25 @@ func (f flushWriter) Write(p []byte) (int, error) {
 }
 
 func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handler {
+	return proxyHandlerWithRelay(upstream, client, mint, parseRelayURL(os.Getenv("ZEN_RELAY_URL")))
+}
+
+func proxyHandlerWithRelay(upstream string, client *http.Client, mint *idMint, relay relayConfig) http.Handler {
 	base := strings.TrimRight(upstream, "/")
+	egressClient := client
+	if relay.enabled() {
+		relayClient := *client
+		relayClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+		egressClient = &relayClient
+	}
 	apiKey := os.Getenv("OPENCODE_GO_API_KEY")
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if relay.err != nil {
+			http.Error(w, relay.err.Error(), http.StatusInternalServerError)
+			return
+		}
 		started := time.Now()
 		session, _ := r.Context().Value(contextKey{}).(string)
 		if session == "" {
@@ -226,6 +259,8 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 			return
 		}
 		museChat, streaming, chatWire, responsesWire, clientStream, responsesToChat, nativeFallback := false, false, false, false, false, false, false
+		var injectedTools map[string]bool
+		var toolFilter toolCallFilter
 		requestedModel := ""
 		var nativeResponses []byte
 		if decoded {
@@ -241,10 +276,10 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 				if forcedStream {
 					requestBody["stream"] = true
 				}
-				toolsChanged := augmentFlatTools(requestBody)
-				choiceChanged := sanitizeResponsesToolChoice(requestBody)
+				injectedTools = augmentFlatTools(requestBody)
+				toolFilter = requestToolFilter(injectedTools)
 				nativeResponsesBody := original
-				if forcedStream || toolsChanged || choiceChanged {
+				if forcedStream || len(injectedTools) > 0 {
 					updated, marshalErr := json.Marshal(requestBody)
 					if marshalErr != nil {
 						http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -270,6 +305,14 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 			}
 		case strings.Contains(r.URL.Path, "/v1/chat/completions") && isMuseModel(requestedModel):
 			museChat = true
+			callerTools, _ := requestBody["tools"].([]any)
+			injectedTools = augmentChatTools(requestBody)
+			toolFilter = requestToolFilter(injectedTools)
+			if len(callerTools) == 0 {
+				if _, choiceProvided := requestBody["tool_choice"]; !choiceProvided {
+					requestBody["tool_choice"] = "none"
+				}
+			}
 			converted, marshalErr := json.Marshal(buildResponsesRequest(requestBody))
 			if marshalErr != nil {
 				http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -285,12 +328,19 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 			return
 		default:
 			if decoded {
-				toolsChanged := augmentChatTools(requestBody)
+				callerTools, _ := requestBody["tools"].([]any)
+				injectedTools = augmentChatTools(requestBody)
+				if strings.Contains(r.URL.Path, "/v1/chat/completions") && len(callerTools) == 0 {
+					if _, choiceProvided := requestBody["tool_choice"]; !choiceProvided {
+						requestBody["tool_choice"] = "none"
+					}
+				}
+				toolFilter = requestToolFilter(injectedTools)
 				if strings.Contains(r.URL.Path, "/v1/chat/completions") {
 					chatWire = true
 					requestBody["stream"] = true
 				}
-				if toolsChanged || chatWire {
+				if len(injectedTools) > 0 || chatWire {
 					updated, marshalErr := json.Marshal(requestBody)
 					if marshalErr != nil {
 						http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -328,11 +378,16 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 		contentLength := r.ContentLength
 		headers := r.Header.Clone()
 		stripHopHeaders(headers)
+		if relay.enabled() {
+			headers.Del("x-relay-target")
+			headers.Del("x-relay-path")
+		}
 		headers.Set("User-Agent", fingerprintUA)
 		headers.Set("x-opencode-client", "desktop")
-		headers.Set("x-opencode-project", "global")
+		headers.Set("x-opencode-project", opencodeProjectID)
 		headers.Set("x-opencode-session", session)
 		headers.Set("x-opencode-session-id", session)
+		headers.Set("x-session-affinity", session)
 		if apiKey != "" {
 			headers.Set("Authorization", "Bearer "+apiKey)
 		}
@@ -348,7 +403,11 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 		defer cancel()
 		replay := &responseReplayState{}
 		var finalErr error
-		for attempt := 1; attempt <= maxAttempts; attempt++ {
+		attemptLimit := maxAttempts
+		if relay.enabled() {
+			attemptLimit = 1
+		}
+		for attempt := 1; attempt <= attemptLimit; attempt++ {
 			attempts = attempt
 			if err := loopCtx.Err(); err != nil {
 				finalErr = err
@@ -356,7 +415,19 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 			}
 			attemptCtx, cancelAttempt := context.WithCancel(r.Context())
 			stopAttempt := context.AfterFunc(loopCtx, cancelAttempt)
-			out, reqErr := http.NewRequestWithContext(attemptCtx, r.Method, target, bytes.NewReader(bodyBytes))
+			requestURL := target
+			relayPath := ""
+			if relay.enabled() {
+				relayRequest, path, relayErr := relay.requestURL(target)
+				if relayErr != nil {
+					stopAttempt()
+					cancelAttempt()
+					finalErr = relayErr
+					break
+				}
+				requestURL, relayPath = relayRequest.String(), path
+			}
+			out, reqErr := http.NewRequestWithContext(attemptCtx, r.Method, requestURL, bytes.NewReader(bodyBytes))
 			if reqErr != nil {
 				stopAttempt()
 				cancelAttempt()
@@ -364,12 +435,16 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 				break
 			}
 			out.Header, out.ContentLength = headers.Clone(), contentLength
-			resp, doErr := client.Do(out)
+			if relay.enabled() {
+				out.Header.Set("x-relay-target", relayTarget)
+				out.Header.Set("x-relay-path", relayPath)
+			}
+			resp, doErr := egressClient.Do(out)
 			stopAttempt()
 			if doErr != nil {
 				cancelAttempt()
 				finalErr = doErr
-				if r.Context().Err() != nil || attempt == maxAttempts || loopCtx.Err() != nil {
+				if relay.enabled() || r.Context().Err() != nil || attempt == maxAttempts || loopCtx.Err() != nil {
 					break
 				}
 				retryLog(attempt, "transport", session)
@@ -378,7 +453,7 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 				}
 				continue
 			}
-			if retryableStatus(resp.StatusCode) {
+			if retryableStatus(resp.StatusCode) && !relay.enabled() {
 				finalErr = fmt.Errorf("upstream status %d", resp.StatusCode)
 				delay := retryDelay(attempt, resp.Header, resp.StatusCode)
 				_ = resp.Body.Close()
@@ -394,7 +469,7 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 				fallbackBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 				_ = resp.Body.Close()
 				cancelAttempt()
-				if readErr == nil && bytes.Contains(fallbackBody, []byte("ModelProtocolUnsupported")) {
+				if !relay.enabled() && readErr == nil && bytes.Contains(fallbackBody, []byte("ModelProtocolUnsupported")) {
 					nativeFallback = true
 					responsesToChat = false
 					responsesWire = true
@@ -419,12 +494,12 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 					w.Header().Set("Cache-Control", "no-cache")
 					writer := newSerializedStreamWriter(w, clientKeepAliveInterval)
 					resp.Body = watchUpstreamBody(resp.Body, upstreamIdleTimeout, session)
-					attemptStatus, retryable := writeResponsesAsChat(writer, resp, requestedModel, true, replay)
+					attemptStatus, retryable := writeResponsesAsChat(writer, resp, requestedModel, true, replay, toolFilter)
 					_ = resp.Body.Close()
 					cancelAttempt()
 					writer.Close()
 					status = attemptStatus
-					if retryable && attempt < maxAttempts && r.Context().Err() == nil && waitRetry(loopCtx, retryDelay(attempt, nil, 0)) {
+					if retryable && !relay.enabled() && attempt < maxAttempts && r.Context().Err() == nil && waitRetry(loopCtx, retryDelay(attempt, nil, 0)) {
 						retryLog(attempt, "stream_before_content", session)
 						continue
 					}
@@ -438,8 +513,7 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 						w.Header().Add(key, value)
 					}
 				}
-				status, _ = writeResponsesAsChat(w, resp, requestedModel, false, replay)
-				_ = resp.Body.Close()
+				status, _ = writeResponsesAsChat(w, resp, requestedModel, false, replay, toolFilter)
 				cancelAttempt()
 				return
 			}
@@ -450,12 +524,12 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 					w.Header().Set("Cache-Control", "no-cache")
 					writer := newSerializedStreamWriter(w, clientKeepAliveInterval)
 					resp.Body = watchUpstreamBody(resp.Body, upstreamIdleTimeout, session)
-					attemptStatus, retryable := writeChatStreamAsResponses(writer, resp.Body, requestedModel)
+					attemptStatus, retryable := writeChatStreamAsResponses(writer, resp.Body, requestedModel, toolFilter)
 					_ = resp.Body.Close()
 					cancelAttempt()
 					writer.Close()
 					status = attemptStatus
-					if retryable && attempt < maxAttempts && r.Context().Err() == nil && waitRetry(loopCtx, retryDelay(attempt, nil, 0)) {
+					if retryable && !relay.enabled() && attempt < maxAttempts && r.Context().Err() == nil && waitRetry(loopCtx, retryDelay(attempt, nil, 0)) {
 						retryLog(attempt, "stream_before_content", session)
 						continue
 					}
@@ -469,7 +543,7 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 				_ = resp.Body.Close()
 				cancelAttempt()
 				if aggErr != nil {
-					if errors.Is(aggErr, errEmptyChatStream) && attempt < maxAttempts && r.Context().Err() == nil && waitRetry(loopCtx, retryDelay(attempt, nil, 0)) {
+					if errors.Is(aggErr, errEmptyChatStream) && !relay.enabled() && attempt < maxAttempts && r.Context().Err() == nil && waitRetry(loopCtx, retryDelay(attempt, nil, 0)) {
 						retryLog(attempt, "empty_chat_stream", session)
 						continue
 					}
@@ -478,8 +552,10 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 				}
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
+				if toolFilter.enabled() {
+					stripChatCompletionToolCalls(completion, toolFilter)
+				}
 				_ = json.NewEncoder(w).Encode(chatCompletionToResponse(completion))
-				status = http.StatusOK
 				return
 			}
 			if chatWire && !clientStream && isSSE && resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -488,7 +564,7 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 				_ = resp.Body.Close()
 				cancelAttempt()
 				if aggErr != nil {
-					if errors.Is(aggErr, errEmptyChatStream) && attempt < maxAttempts && r.Context().Err() == nil && waitRetry(loopCtx, retryDelay(attempt, nil, 0)) {
+					if errors.Is(aggErr, errEmptyChatStream) && !relay.enabled() && attempt < maxAttempts && r.Context().Err() == nil && waitRetry(loopCtx, retryDelay(attempt, nil, 0)) {
 						retryLog(attempt, "empty_chat_stream", session)
 						continue
 					}
@@ -497,8 +573,10 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 				}
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
+				if toolFilter.enabled() {
+					stripChatCompletionToolCalls(completion, toolFilter)
+				}
 				_ = json.NewEncoder(w).Encode(completion)
-				status = http.StatusOK
 				return
 			}
 			if responsesWire && !clientStream && isSSE && resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -507,7 +585,7 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 				_ = resp.Body.Close()
 				cancelAttempt()
 				if aggErr != nil {
-					if errors.Is(aggErr, errEmptyResponsesStream) && attempt < maxAttempts && r.Context().Err() == nil && waitRetry(loopCtx, retryDelay(attempt, nil, 0)) {
+					if errors.Is(aggErr, errEmptyResponsesStream) && !relay.enabled() && attempt < maxAttempts && r.Context().Err() == nil && waitRetry(loopCtx, retryDelay(attempt, nil, 0)) {
 						retryLog(attempt, "empty_responses_stream", session)
 						continue
 					}
@@ -516,16 +594,19 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 				}
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
+				if toolFilter.enabled() {
+					stripResponsesToolCalls(completion, toolFilter)
+				}
 				_ = json.NewEncoder(w).Encode(completion)
 				status = http.StatusOK
 				return
 			}
 
 			if streaming && isSSE {
-				attemptStatus, retryable := relayPassThroughStream(w, r, resp, session)
+				attemptStatus, retryable := relayPassThroughStream(w, r, resp, session, toolFilter, responsesWire)
 				cancelAttempt()
 				status = attemptStatus
-				if retryable && attempt < maxAttempts && r.Context().Err() == nil && waitRetry(loopCtx, retryDelay(attempt, nil, 0)) {
+				if retryable && !relay.enabled() && attempt < maxAttempts && r.Context().Err() == nil && waitRetry(loopCtx, retryDelay(attempt, nil, 0)) {
 					retryLog(attempt, "stream_before_content", session)
 					continue
 				}
@@ -538,12 +619,34 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 				return
 			}
 
+			status = resp.StatusCode
+			if toolFilter.enabled() && status >= 200 && status < 300 && strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "application/json") {
+				responseBody, readErr := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if readErr != nil {
+					cancelAttempt()
+					status = writeJSONError(w, "upstream response failed")
+					return
+				}
+				responseBody, _ = filterToolCallsInJSON(responseBody, toolFilter)
+				for key, values := range resp.Header {
+					for _, value := range values {
+						if !strings.EqualFold(key, "Content-Length") {
+							w.Header().Add(key, value)
+						}
+					}
+				}
+				w.Header().Set("Content-Length", strconv.Itoa(len(responseBody)))
+				w.WriteHeader(status)
+				_, _ = w.Write(responseBody)
+				cancelAttempt()
+				return
+			}
 			for key, values := range resp.Header {
 				for _, value := range values {
 					w.Header().Add(key, value)
 				}
 			}
-			status = resp.StatusCode
 			w.WriteHeader(status)
 			_, _ = io.Copy(flushWriter{w}, resp.Body)
 			_ = resp.Body.Close()
@@ -559,6 +662,28 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 		}
 		_ = finalErr
 	})
+}
+
+func filterToolCallsInJSON(body []byte, filter toolCallFilter) ([]byte, bool) {
+	if !filter.enabled() {
+		return body, false
+	}
+	var payload map[string]any
+	if json.Unmarshal(body, &payload) != nil || payload == nil {
+		return body, false
+	}
+	if _, ok := payload["choices"].([]any); ok {
+		stripChatCompletionToolCalls(payload, filter)
+	} else if _, ok := payload["output"].([]any); ok {
+		stripResponsesToolCalls(payload, filter)
+	} else {
+		return body, false
+	}
+	filtered, err := json.Marshal(payload)
+	if err != nil {
+		return body, false
+	}
+	return filtered, true
 }
 
 func retryableStatus(status int) bool {
@@ -673,11 +798,15 @@ func initStabilityKnobs() {
 func main() {
 	initStabilityKnobs()
 
+	relay := parseRelayURL(os.Getenv("ZEN_RELAY_URL"))
+	if relay.err != nil {
+		log.Fatal(relay.err)
+	}
 	mint := &idMint{}
 	client := newUpstreamClient()
 	server := &http.Server{
 		Addr:    "0.0.0.0:" + envOr("ZEN_PORT", "8801"),
-		Handler: proxyHandler(envOr("ZEN_UPSTREAM", "https://opencode.ai/inference"), client, mint),
+		Handler: proxyHandlerWithRelay(envOr("ZEN_UPSTREAM", "https://opencode.ai/inference"), client, mint, relay),
 		ConnContext: func(ctx context.Context, _ net.Conn) context.Context {
 			session := mint.mint("ses_")
 			log.Printf("new-conn ses=%s", session)

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -329,7 +330,7 @@ func isClientDisconnect(err error) bool {
 	return strings.Contains(s, "broken pipe") || strings.Contains(s, "connection reset") || strings.Contains(s, "closed network connection")
 }
 
-func relayPassThroughStream(w http.ResponseWriter, r *http.Request, resp *http.Response, session string) (int, bool) {
+func relayPassThroughStream(w http.ResponseWriter, r *http.Request, resp *http.Response, session string, filter toolCallFilter, responsesWire bool) (int, bool) {
 	resp.Body = watchUpstreamBody(resp.Body, upstreamIdleTimeout, session)
 	defer resp.Body.Close()
 
@@ -366,27 +367,111 @@ func relayPassThroughStream(w http.ResponseWriter, r *http.Request, resp *http.R
 	}
 	writer := newSerializedStreamWriter(w, clientKeepAliveInterval)
 	defer writer.Close()
-
 	w.WriteHeader(resp.StatusCode)
-
+	if !filter.enabled() {
+		tracker := &clientWriteTracker{w: writer}
+		doneWriter := &sseDoneWriter{w: tracker}
+		written, writeErr := 0, error(nil)
+		if len(prelude) > 0 {
+			count, err := doneWriter.Write(prelude)
+			written += count
+			writeErr = err
+		}
+		if readErr == nil && writeErr == nil {
+			count, err := io.Copy(doneWriter, resp.Body)
+			written += int(count)
+			writeErr = err
+		} else if readErr != io.EOF && writeErr == nil {
+			writeErr = readErr
+		}
+		if writeErr != nil && !doneWriter.tracker.sawDone {
+			if tracker.writeErr != nil || isClientDisconnect(writeErr) {
+				log.Printf("client_disconnected bytes_written=%d err=%v ses=%s", written, writeErr, session)
+				return resp.StatusCode, false
+			}
+			if r.Context().Err() == nil {
+				log.Printf("stream_interrupted bytes_written=%d err=%v ses=%s", written, writeErr, session)
+				_, _ = io.WriteString(w, interruptedStreamPair)
+			}
+		}
+		return resp.StatusCode, false
+	}
+	toolState := &streamToolFilter{filter: filter, responsesWire: responsesWire, hiddenIDs: make(map[string]bool), hiddenIndexes: make(map[int]bool), pendingTools: make(map[int]*pendingChatStreamTool)}
 	tracker := &clientWriteTracker{w: writer}
 	doneWriter := &sseDoneWriter{w: tracker}
+	writeEvent := func(lines []string, raw []byte) (int, error) {
+		dataLines := make([]string, 0, len(lines))
+		metadata := make([]string, 0, len(lines))
+		for _, line := range lines {
+			if strings.HasPrefix(line, "data:") {
+				value := strings.TrimPrefix(line, "data:")
+				dataLines = append(dataLines, strings.TrimPrefix(value, " "))
+			} else {
+				metadata = append(metadata, line)
+			}
+		}
+		data := []byte(strings.Join(dataLines, "\n"))
+		if filter.enabled() && len(data) > 0 {
+			filtered, keep := transformInjectedToolEvent(data, toolState)
+			if !keep {
+				return 0, nil
+			}
+			if bytes.Equal(filtered, data) {
+				return doneWriter.Write(raw)
+			}
+			data = filtered
+		} else if filter.enabled() {
+			return doneWriter.Write(raw)
+		}
+		var event strings.Builder
+		for _, line := range metadata {
+			event.WriteString(line)
+			event.WriteString("\n")
+		}
+		if len(dataLines) > 0 {
+			event.WriteString("data: ")
+			event.Write(data)
+			event.WriteString("\n")
+		}
+		event.WriteString("\n")
+		return doneWriter.Write([]byte(event.String()))
+	}
 
-	written, writeErr := 0, error(nil)
-	if len(prelude) > 0 {
-		count, err := doneWriter.Write(prelude)
+	reader := bufio.NewReaderSize(io.MultiReader(bytes.NewReader(prelude), resp.Body), 64*1024)
+	var lines []string
+	var rawEvent []byte
+	written := 0
+	var writeErr error
+	for {
+		line, err := readSSELine(reader)
+		if len(line) > 0 {
+			rawEvent = append(rawEvent, line...)
+			trimmed := strings.TrimRight(line, "\r\n")
+			if trimmed == "" {
+				count, eventErr := writeEvent(lines, rawEvent)
+				written += count
+				lines = lines[:0]
+				rawEvent = rawEvent[:0]
+				if eventErr != nil {
+					writeErr = eventErr
+					break
+				}
+			} else {
+				lines = append(lines, trimmed)
+			}
+		}
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				writeErr = err
+			}
+			break
+		}
+	}
+	if writeErr == nil && (len(lines) > 0 || len(rawEvent) > 0) {
+		count, err := writeEvent(lines, rawEvent)
 		written += count
 		writeErr = err
 	}
-
-	if readErr == nil && writeErr == nil {
-		count, err := io.Copy(doneWriter, resp.Body)
-		written += int(count)
-		writeErr = err
-	} else if readErr != io.EOF && writeErr == nil {
-		writeErr = readErr
-	}
-
 	if writeErr != nil && !doneWriter.tracker.sawDone {
 		if tracker.writeErr != nil || isClientDisconnect(writeErr) {
 			log.Printf("client_disconnected bytes_written=%d err=%v ses=%s", written, writeErr, session)
@@ -398,4 +483,273 @@ func relayPassThroughStream(w http.ResponseWriter, r *http.Request, resp *http.R
 		}
 	}
 	return resp.StatusCode, false
+
+}
+
+type streamToolFilter struct {
+	filter        toolCallFilter
+	responsesWire bool
+	hiddenIDs     map[string]bool
+	hiddenIndexes map[int]bool
+	pendingTools  map[int]*pendingChatStreamTool
+	pendingOrder  []int
+	callerSeen    bool
+	hiddenCall    bool
+}
+
+type pendingChatStreamTool struct {
+	call             map[string]any
+	name             strings.Builder
+	arguments        strings.Builder
+	visible          bool
+	emittedName      int
+	emittedArguments int
+}
+
+func transformInjectedToolEvent(data []byte, state *streamToolFilter) ([]byte, bool) {
+	if string(data) == "[DONE]" {
+		return data, true
+	}
+	var event map[string]any
+	if json.Unmarshal(data, &event) != nil {
+		return data, true
+	}
+	modified := false
+	if state.responsesWire {
+		switch event["type"] {
+		case "response.output_item.added", "response.output_item.done":
+			item, _ := event["item"].(map[string]any)
+			if item != nil && item["type"] == "function_call" {
+				callID := stringValue(item["call_id"])
+				itemID := stringValue(item["id"])
+				if state.filter.hides(stringValue(item["name"])) {
+					if callID != "" {
+						state.hiddenIDs[callID] = true
+					}
+					if itemID != "" {
+						state.hiddenIDs[itemID] = true
+					}
+					return nil, false
+				}
+				state.callerSeen = true
+			}
+		case "response.function_call_arguments.delta", "response.function_call_arguments.done":
+			callID := stringValue(event["call_id"])
+			if callID == "" {
+				callID = stringValue(event["item_id"])
+			}
+			if state.hiddenIDs[callID] {
+				return nil, false
+			}
+		case "response.completed":
+			response, _ := event["response"].(map[string]any)
+			if response != nil {
+				output, _ := response["output"].([]any)
+				filtered := output[:0]
+				for _, raw := range output {
+					item, _ := raw.(map[string]any)
+					if item != nil && item["type"] == "function_call" && state.filter.hides(stringValue(item["name"])) {
+						modified = true
+						continue
+					}
+					filtered = append(filtered, raw)
+				}
+				if modified {
+					response["output"] = filtered
+				}
+			}
+		}
+	} else {
+		modified = transformChatToolEvents(event, state)
+	}
+	if !modified {
+		return data, true
+	}
+	filtered, err := json.Marshal(event)
+	if err != nil {
+		return data, true
+	}
+	return filtered, true
+}
+func transformChatToolEvents(event map[string]any, state *streamToolFilter) bool {
+	choices, _ := event["choices"].([]any)
+	modified := false
+	for _, rawChoice := range choices {
+		choice, _ := rawChoice.(map[string]any)
+		if choice == nil {
+			continue
+		}
+		final := choice["finish_reason"] != nil
+		removed := false
+		for _, key := range []string{"delta", "message"} {
+			body, _ := choice[key].(map[string]any)
+			calls, _ := body["tool_calls"].([]any)
+			if body == nil || len(calls) == 0 {
+				continue
+			}
+			filtered := make([]any, 0, len(calls))
+			for _, rawCall := range calls {
+				call, _ := rawCall.(map[string]any)
+				if call == nil {
+					filtered = append(filtered, rawCall)
+					continue
+				}
+				slot, hasSlot := integerValue(call["index"])
+				function, _ := call["function"].(map[string]any)
+				if function == nil {
+					function = map[string]any{}
+				}
+				if !hasSlot {
+					if state.filter.hides(stringValue(function["name"])) {
+						removed, state.hiddenCall = true, true
+						continue
+					}
+					filtered = append(filtered, rawCall)
+					continue
+				}
+				if state.hiddenIndexes[slot] {
+					removed, state.hiddenCall = true, true
+					continue
+				}
+				pending := state.pendingTools[slot]
+				if pending == nil {
+					state.pendingOrder = append(state.pendingOrder, slot)
+					pending = &pendingChatStreamTool{call: map[string]any{"index": slot}}
+					state.pendingTools[slot] = pending
+				}
+				for key, value := range call {
+					if key != "index" && key != "function" {
+						pending.call[key] = value
+					}
+				}
+				functionFields, _ := pending.call["function"].(map[string]any)
+				if functionFields == nil {
+					functionFields = make(map[string]any)
+					pending.call["function"] = functionFields
+				}
+				for key, value := range function {
+					if key != "name" && key != "arguments" {
+						functionFields[key] = value
+					}
+				}
+				pending.name.WriteString(stringValue(function["name"]))
+				pending.arguments.WriteString(stringValue(function["arguments"]))
+				name := pending.name.String()
+				if state.filter.hides(name) && final {
+					state.hiddenIndexes[slot] = true
+					if id := stringValue(pending.call["id"]); id != "" {
+						state.hiddenIDs[id] = true
+					}
+					delete(state.pendingTools, slot)
+					removed, state.hiddenCall = true, true
+					continue
+				}
+				if !pending.visible {
+					possibleInjectedName := false
+					for injectedName := range state.filter.injected {
+						if strings.HasPrefix(injectedName, name) {
+							possibleInjectedName = true
+							break
+						}
+					}
+					if name == "" || possibleInjectedName && !final {
+						removed = true
+						continue
+					}
+					pending.visible = true
+					state.callerSeen = true
+				}
+				out := map[string]any{"index": slot}
+				for key, value := range pending.call {
+					if key != "index" && key != "function" {
+						out[key] = value
+					}
+				}
+				functionFields, _ = pending.call["function"].(map[string]any)
+				outFunction := make(map[string]any, len(functionFields)+2)
+				for key, value := range functionFields {
+					outFunction[key] = value
+				}
+				if pending.emittedName == 0 && name != "" {
+					outFunction["name"] = name
+					pending.emittedName = pending.name.Len()
+				} else if pending.name.Len() > pending.emittedName {
+					outFunction["name"] = name[pending.emittedName:]
+					pending.emittedName = pending.name.Len()
+				}
+				if pending.arguments.Len() > pending.emittedArguments {
+					outFunction["arguments"] = pending.arguments.String()[pending.emittedArguments:]
+					pending.emittedArguments = pending.arguments.Len()
+				}
+				out["function"] = outFunction
+				filtered = append(filtered, out)
+			}
+			modified = true
+			if len(filtered) == 0 {
+				delete(body, "tool_calls")
+			} else {
+				body["tool_calls"] = filtered
+			}
+		}
+		if final {
+			for _, slot := range state.pendingOrder {
+				pending := state.pendingTools[slot]
+				if pending == nil || pending.visible {
+					continue
+				}
+				name := pending.name.String()
+				delete(state.pendingTools, slot)
+				if name == "" {
+					continue
+				}
+				if state.filter.hides(name) {
+					state.hiddenIndexes[slot] = true
+					if id := stringValue(pending.call["id"]); id != "" {
+						state.hiddenIDs[id] = true
+					}
+					removed, state.hiddenCall = true, true
+					continue
+				}
+				body, _ := choice["delta"].(map[string]any)
+				if body == nil {
+					body = map[string]any{}
+					choice["delta"] = body
+				}
+				calls, _ := body["tool_calls"].([]any)
+				call := map[string]any{"index": slot}
+				for key, value := range pending.call {
+					if key != "index" && key != "function" {
+						call[key] = value
+					}
+				}
+				functionFields, _ := pending.call["function"].(map[string]any)
+				function := make(map[string]any, len(functionFields)+2)
+				for key, value := range functionFields {
+					function[key] = value
+				}
+				function["name"] = name
+				function["arguments"] = pending.arguments.String()
+				call["function"] = function
+				body["tool_calls"] = append(calls, call)
+				state.callerSeen = true
+				modified = true
+			}
+		}
+		if (removed || state.hiddenCall) && choice["finish_reason"] == "tool_calls" && !state.callerSeen {
+			choice["finish_reason"] = "stop"
+			modified = true
+		}
+	}
+	return modified
+}
+
+func integerValue(value any) (int, bool) {
+	switch number := value.(type) {
+	case float64:
+		return int(number), true
+	case int:
+		return number, true
+	default:
+		return 0, false
+	}
 }
