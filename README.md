@@ -4,13 +4,17 @@
 the OpenCode desktop client, which is what the free tier checks for. Any
 OpenAI-compatible client can point at it to reach the `-free` catalog. The
 upstream sees the desktop user agent, a minted `ses_`/`msg_` id pair, the
-`x-opencode-*` headers and a block of four tools (`bash`, `glob`, `grep`, `read`);
-the caller's `Authorization` header is forwarded unchanged and no key is stored.
+`x-opencode-*` headers (including a process-stable project ID and session affinity),
+and the six captured OpenCode `bash`, `edit`, `glob`, `grep`, `read`, and `write`
+tools when the caller supplies no tools. Caller tool lists are preserved unchanged.
 
 ## Config
 
 - Listener `0.0.0.0:8801`, override with `ZEN_PORT`.
 - `ZEN_UPSTREAM`: upstream base URL, defaults to `https://opencode.ai/inference`.
+- `ZEN_RELAY_URL`: optional full HTTPS relay endpoint URL; unset means requests connect directly to `ZEN_UPSTREAM`. Relay URLs may include a fixed path, but not userinfo, query, or fragment.
+- Relay mode sends requests to the configured relay with `x-relay-target: https://opencode.ai` and the exact final upstream path and query in `x-relay-path`; caller-supplied relay headers are ignored. Relay mode uses one upstream attempt and does not retry or protocol-fallback, avoiding duplicate inference when delivery is uncertain.
+- The relay can observe or log request bodies, authorization and fingerprint headers, and responses. Configure only a trusted HTTPS relay.
 - `OPENCODE_GO_API_KEY`: when set, forwarded upstream as `Authorization: Bearer <key>`.
 - `ZEN_RETRY_BUDGET`: retry-loop budget in seconds (default `300`); exhausted, the
   proxy answers `502 upstream_interrupted`.
@@ -22,10 +26,16 @@ the caller's `Authorization` header is forwarded unchanged and no key is stored.
 The upstream serves a free-tier request only when the body carries
 `"stream": true` and a tool named exactly `read`; `stream: false` returns
 `403 FreeTierError` whatever the headers say, and arbitrary tool definitions
-(`bash`, `glob`, `grep` and any other name) do not satisfy the gate on their own.
-This proxy therefore always forces `stream: true` upstream and injects the
-`bash`/`glob`/`grep`/`read` quartet when the caller sends none, so a plain chat
-call passes.
+do not satisfy the gate on their own. This proxy forces `stream: true` upstream.
+For upstream URLs under the `/inference` path family, it replaces caller
+definitions named `bash`, `edit`, `glob`, `grep`, `read`, or `write` with the
+captured OpenCode definitions, preserves arbitrary tools, and adds missing
+gate-required `bash`, `glob`, `grep`, and `read` tools. Empty tool lists retain
+the existing six-tool injection behavior. Outside `/inference`, tool handling
+retains its existing behavior. For Chat Completions, the proxy defaults
+`tool_choice` to `"none"` only when the caller did not supply tools or a choice;
+Responses requests leave the choice unpinned. Calls to proxy-managed core tools
+are removed from responses, while calls to arbitrary caller tools remain available.
 
 ## Run
 
@@ -70,8 +80,11 @@ Reach it as `http://oc-zen-go:8801/v1`.
 
 ## Wires
 
+- OpenAI Chat Completions and Responses, Anthropic Messages, and Gemini requests
+  use the `/openai`, `/anthropic`, and `/google` inference families. Query strings
+  are retained.
 - `muse-spark-*` requests are converted to the Responses wire in flight.
 - `POST /v1/responses` on any other model is converted to the chat wire and the
-  reply converted back, retrying once on the native `/v1/responses` path when the
+  reply converted back, retrying once on the native Responses route when the
   upstream answers `400 ModelProtocolUnsupported`.
 - `jev-*` needs the systemone wire and is rejected with `400`.

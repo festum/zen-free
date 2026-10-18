@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -659,7 +660,7 @@ func TestRelayPassThroughStreamReturnsUpstreamStatus(t *testing.T) {
 		Header:     make(http.Header),
 		Body:       io.NopCloser(strings.NewReader("data: {\"id\":\"x\"}\n\n")),
 	}
-	status, retryable := relayPassThroughStream(rec, req, resp, "ses-status-test")
+	status, retryable := relayPassThroughStream(rec, req, resp, "ses-status-test", toolCallFilter{}, false)
 	if retryable {
 		t.Fatal("401 pass-through must not be flagged retryable")
 	}
@@ -668,6 +669,169 @@ func TestRelayPassThroughStreamReturnsUpstreamStatus(t *testing.T) {
 	}
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("client status = %d, want 401 (client must still receive upstream status)", rec.Code)
+	}
+}
+
+func TestTransformChatStreamBuffersFragmentedInjectedNameAndKeepsCallerCall(t *testing.T) {
+	filter := toolCallFilter{injected: map[string]bool{"bash": true, "edit": true, "glob": true, "grep": true, "read": true, "write": true}}
+	state := &streamToolFilter{filter: filter, hiddenIDs: make(map[string]bool), hiddenIndexes: make(map[int]bool), pendingTools: make(map[int]*pendingChatStreamTool)}
+	transform := func(input string) map[string]any {
+		t.Helper()
+		filtered, keep := transformInjectedToolEvent([]byte(input), state)
+		if !keep {
+			t.Fatal("Chat completion event was suppressed")
+		}
+		var event map[string]any
+		if err := json.Unmarshal(filtered, &event); err != nil {
+			t.Fatalf("decode transformed event: %v", err)
+		}
+		return event
+	}
+	first := transform(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-hidden","type":"function","function":{"name":"ba","arguments":"{"}},{"index":1,"id":"call-visible","type":"function","function":{"name":"look","arguments":"{\"q\":"}}]}}]}`)
+	firstChoice := object(t, array(t, first["choices"])[0])
+	firstCalls := array(t, object(t, firstChoice["delta"])["tool_calls"])
+	if len(firstCalls) != 1 {
+		t.Fatalf("first event calls = %#v, want visible caller call only", firstCalls)
+	}
+	firstCall := object(t, firstCalls[0])
+	firstFunction := object(t, firstCall["function"])
+	if firstCall["index"] != float64(1) || firstFunction["name"] != "look" || firstFunction["arguments"] != `{"q":` {
+		t.Fatalf("first caller fragment = %#v", firstCall)
+	}
+
+	second := transform(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"sh","arguments":"}"}},{"index":1,"function":{"name":"up","arguments":"1}"}}]},"finish_reason":"tool_calls"}]}`)
+	secondChoice := object(t, array(t, second["choices"])[0])
+	calls := array(t, object(t, secondChoice["delta"])["tool_calls"])
+	if len(calls) != 1 {
+		t.Fatalf("transformed calls = %#v, want visible caller call only", calls)
+	}
+	call := object(t, calls[0])
+	function := object(t, call["function"])
+	if call["index"] != float64(1) || call["id"] != "call-visible" || function["name"] != "up" || function["arguments"] != "1}" {
+		t.Fatalf("caller continuation was not preserved: %#v", call)
+	}
+	if firstFunction["name"].(string)+function["name"].(string) != "lookup" || firstFunction["arguments"].(string)+function["arguments"].(string) != `{"q":1}` {
+		t.Fatalf("reassembled caller call = name %q arguments %q", firstFunction["name"].(string)+function["name"].(string), firstFunction["arguments"].(string)+function["arguments"].(string))
+	}
+	if secondChoice["finish_reason"] != "tool_calls" {
+		t.Fatalf("caller finish_reason = %#v, want tool_calls", secondChoice["finish_reason"])
+	}
+}
+
+func TestTransformChatStreamFlushesNonInjectedPrefixAtFinish(t *testing.T) {
+	state := &streamToolFilter{
+		filter:        toolCallFilter{injected: map[string]bool{"bash": true}},
+		hiddenIDs:     make(map[string]bool),
+		hiddenIndexes: make(map[int]bool),
+		pendingTools:  make(map[int]*pendingChatStreamTool),
+	}
+	first := `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-prefix","function":{"name":"ba","arguments":"{}"}}]}}]}`
+	if _, keep := transformInjectedToolEvent([]byte(first), state); !keep {
+		t.Fatal("first fragment was suppressed")
+	}
+	final := `{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`
+	filtered, keep := transformInjectedToolEvent([]byte(final), state)
+	if !keep {
+		t.Fatal("finish event was suppressed")
+	}
+	var event map[string]any
+	if err := json.Unmarshal(filtered, &event); err != nil {
+		t.Fatalf("decode final event: %v", err)
+	}
+	choice := object(t, array(t, event["choices"])[0])
+	calls := array(t, object(t, choice["delta"])["tool_calls"])
+	if len(calls) != 1 {
+		t.Fatalf("final calls = %#v, want buffered prefix preserved", calls)
+	}
+	call := object(t, calls[0])
+	function := object(t, call["function"])
+	if function["name"] != "ba" || function["arguments"] != "{}" || choice["finish_reason"] != "tool_calls" {
+		t.Fatalf("final caller prefix call = %#v; choice %#v", call, choice)
+	}
+}
+func TestTransformChatStreamPreservesCallerNamesBeyondInjectedPrefixesInOrder(t *testing.T) {
+	state := &streamToolFilter{
+		filter:        toolCallFilter{injected: map[string]bool{"bash": true, "edit": true}},
+		hiddenIDs:     make(map[string]bool),
+		hiddenIndexes: make(map[int]bool),
+		pendingTools:  make(map[int]*pendingChatStreamTool),
+	}
+	first := `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":7,"id":"call-seven","type":"function","vendor":"seven","function":{"name":"ba","arguments":"{}","meta":"seven-meta"}},{"index":2,"id":"call-two","type":"function","vendor":"two","function":{"name":"ed","arguments":"[]","meta":"two-meta"}}]}}]}`
+	if _, keep := transformInjectedToolEvent([]byte(first), state); !keep {
+		t.Fatal("prefix fragments were suppressed")
+	}
+	final := `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":7,"function":{"name":"sh-tool"}},{"index":2,"function":{"name":"it-helper"}}]},"finish_reason":"tool_calls"}]}`
+	filtered, keep := transformInjectedToolEvent([]byte(final), state)
+	if !keep {
+		t.Fatal("final caller calls were suppressed")
+	}
+	var event map[string]any
+	if err := json.Unmarshal(filtered, &event); err != nil {
+		t.Fatalf("decode transformed event: %v", err)
+	}
+	choice := object(t, array(t, event["choices"])[0])
+	calls := array(t, object(t, choice["delta"])["tool_calls"])
+	if len(calls) != 2 {
+		t.Fatalf("final calls = %#v, want both caller calls", calls)
+	}
+	want := []struct {
+		index  float64
+		id     string
+		vendor string
+		name   string
+		meta   string
+	}{
+		{7, "call-seven", "seven", "bash-tool", "seven-meta"},
+		{2, "call-two", "two", "edit-helper", "two-meta"},
+	}
+	for i, expected := range want {
+		call := object(t, calls[i])
+		function := object(t, call["function"])
+		if call["index"] != expected.index || call["id"] != expected.id || call["vendor"] != expected.vendor || function["name"] != expected.name || function["meta"] != expected.meta {
+			t.Fatalf("call %d = %#v, want index %v id %q vendor %q name %q meta %q", i, call, expected.index, expected.id, expected.vendor, expected.name, expected.meta)
+		}
+	}
+	if choice["finish_reason"] != "tool_calls" {
+		t.Fatalf("finish_reason = %#v, want tool_calls", choice["finish_reason"])
+	}
+}
+
+func TestTransformChatStreamFlushesBufferedCallerCallsInArrivalOrder(t *testing.T) {
+	state := &streamToolFilter{
+		filter:        toolCallFilter{injected: map[string]bool{"bash": true, "edit": true}},
+		hiddenIDs:     make(map[string]bool),
+		hiddenIndexes: make(map[int]bool),
+		pendingTools:  make(map[int]*pendingChatStreamTool),
+	}
+	first := `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":7,"id":"call-seven","type":"function","vendor":"seven","function":{"name":"ba","arguments":"{}","meta":"seven-meta"}},{"index":2,"id":"call-two","type":"function","vendor":"two","function":{"name":"ed","arguments":"[]","meta":"two-meta"}}]}}]}`
+	if _, keep := transformInjectedToolEvent([]byte(first), state); !keep {
+		t.Fatal("prefix fragments were suppressed")
+	}
+	final := `{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`
+	filtered, keep := transformInjectedToolEvent([]byte(final), state)
+	if !keep {
+		t.Fatal("final caller calls were suppressed")
+	}
+	var event map[string]any
+	if err := json.Unmarshal(filtered, &event); err != nil {
+		t.Fatalf("decode transformed event: %v", err)
+	}
+	choice := object(t, array(t, event["choices"])[0])
+	calls := array(t, object(t, choice["delta"])["tool_calls"])
+	if len(calls) != 2 {
+		t.Fatalf("final calls = %#v, want both caller calls", calls)
+	}
+	wantNames := []string{"ba", "ed"}
+	wantIDs := []string{"call-seven", "call-two"}
+	for i, rawCall := range calls {
+		call := object(t, rawCall)
+		function := object(t, call["function"])
+		if call["id"] != wantIDs[i] || function["name"] != wantNames[i] {
+			t.Fatalf("call %d = %#v, want id %q and name %q", i, call, wantIDs[i], wantNames[i])
+		}
+	}
+	if choice["finish_reason"] != "tool_calls" {
+		t.Fatalf("finish_reason = %#v, want tool_calls", choice["finish_reason"])
 	}
 }
 

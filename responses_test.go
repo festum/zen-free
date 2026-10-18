@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -99,8 +101,8 @@ func TestBuildResponsesRequest(t *testing.T) {
 	if got["temperature"] != 0.2 || got["top_p"] != 0.8 || got["max_output_tokens"] != 99 {
 		t.Fatalf("sampling fields = %#v", got)
 	}
-	if _, exists := got["tool_choice"]; exists {
-		t.Fatalf("unsupported named tool_choice was retained: %#v", got["tool_choice"])
+	if got["tool_choice"] == nil || !reflect.DeepEqual(got["tool_choice"], map[string]any{"type": "function", "name": "lookup"}) {
+		t.Fatalf("named tool_choice = %#v, want the selected lookup tool", got["tool_choice"])
 	}
 	tools := array(t, got["tools"])
 	var lookup map[string]any
@@ -158,30 +160,24 @@ func TestBuildResponsesRequestContentParts(t *testing.T) {
 }
 
 func TestBuildResponsesRequestInstructionsToolsAndChoice(t *testing.T) {
+	callerTool := map[string]any{"type": "function", "function": map[string]any{"name": "lookup", "parameters": map[string]any{"type": "object"}}}
+	callerRead := map[string]any{"type": "function", "function": map[string]any{"name": "read", "parameters": map[string]any{"type": "object"}}}
+	wantCallerTool := map[string]any{"type": "function", "name": "lookup", "parameters": map[string]any{"type": "object"}}
+	wantCallerRead := map[string]any{"type": "function", "name": "read", "parameters": map[string]any{"type": "object"}}
 	tests := []struct {
-		name          string
-		tools         []any
-		choice        any
-		wantChoice    any
-		wantPresent   bool
-		wantToolCount int
+		name        string
+		tools       []any
+		choice      any
+		wantChoice  any
+		wantPresent bool
+		wantTools   []any
 	}{
-		{name: "missing quartet and omitted choice", wantToolCount: 4},
-		{
-			name: "all four declared and choice omitted",
-			tools: []any{
-				map[string]any{"type": "function", "name": "bash"}, map[string]any{"type": "function", "name": "glob"},
-				map[string]any{"type": "function", "name": "grep"}, map[string]any{"type": "function", "name": "read"},
-			},
-			wantToolCount: 4,
-		},
-		{name: "auto choice", choice: "auto", wantChoice: "auto", wantPresent: true, wantToolCount: 4},
-		{name: "none choice omitted", choice: "none", wantToolCount: 4},
-		{name: "required choice omitted", choice: "required", wantToolCount: 4},
-		{name: "case-variant auto omitted", choice: "AUTO", wantToolCount: 4},
-		{name: "empty choice omitted", choice: "", wantToolCount: 4},
-		{name: "named choice omitted", choice: map[string]any{"type": "function", "function": map[string]any{"name": "lookup"}}, wantToolCount: 4},
-		{name: "non-string choice omitted", choice: true, wantToolCount: 4},
+		{name: "missing tools stay empty", wantTools: []any{}},
+		{name: "empty tools stay empty", tools: []any{}, wantTools: []any{}},
+		{name: "caller tool preserved", tools: []any{callerTool}, wantTools: []any{wantCallerTool}},
+		{name: "caller read stays alone", tools: []any{callerRead}, wantTools: []any{wantCallerRead}},
+		{name: "auto choice without tools omitted", choice: "auto", wantTools: []any{}},
+		{name: "caller function choice preserved", tools: []any{callerTool}, choice: map[string]any{"type": "function", "function": map[string]any{"name": "lookup"}}, wantChoice: map[string]any{"type": "function", "name": "lookup"}, wantPresent: true, wantTools: []any{wantCallerTool}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -196,96 +192,38 @@ func TestBuildResponsesRequestInstructionsToolsAndChoice(t *testing.T) {
 			if _, exists := got["instructions"]; exists {
 				t.Fatalf("empty instructions should be omitted: %#v", got["instructions"])
 			}
-			tools := array(t, got["tools"])
-			if len(tools) != tt.wantToolCount {
-				t.Fatalf("got %d tools, want %d", len(tools), tt.wantToolCount)
-			}
-			seen := make(map[string]int)
-			for _, value := range tools {
-				tool := object(t, value)
-				if tool["type"] != "function" || tool["name"] == nil || tool["function"] != nil {
-					t.Fatalf("tool is not in flat function format: %#v", tool)
-				}
-				seen[tool["name"].(string)]++
-			}
-			for _, name := range []string{"bash", "glob", "grep", "read"} {
-				if seen[name] != 1 {
-					t.Fatalf("tool %q appears %d times", name, seen[name])
-				}
-			}
 			choice, exists := got["tool_choice"]
-			if exists != tt.wantPresent || choice != tt.wantChoice {
+			if exists != tt.wantPresent || !reflect.DeepEqual(choice, tt.wantChoice) {
 				t.Fatalf("tool_choice = %#v, present=%t; want %#v, present=%t", choice, exists, tt.wantChoice, tt.wantPresent)
+			}
+			tools, exists := got["tools"]
+			if !exists || !reflect.DeepEqual(tools, tt.wantTools) {
+				t.Fatalf("tools = %#v, want %#v", tools, tt.wantTools)
 			}
 		})
 	}
 }
 
-func TestProxyHandlerResponsesToolChoiceSanitization(t *testing.T) {
-	quartet := `[{"type":"function","name":"bash"},{"type":"function","name":"glob"},{"type":"function","name":"grep"},{"type":"function","name":"read"}]`
+func TestProxyHandlerToolAugmentationAndChoicePreservation(t *testing.T) {
+	callerTools := `[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}]`
+	callerChatTools := `[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}]`
+	wantNames := []string{"bash", "edit", "glob", "grep", "read", "write"}
 	tests := []struct {
-		name         string
-		path         string
-		body         string
-		wantChoice   any
-		wantPresent  bool
-		wantInjected bool
+		name          string
+		path          string
+		body          string
+		wantChoice    any
+		wantPresent   bool
+		wantNames     []string
+		wantNested    bool
+		wantToolsJSON string
 	}{
-		{
-			name:         "omitted choice with decoys",
-			path:         "/v1/chat/completions",
-			body:         `{"model":"muse-spark-1.3","messages":[]}`,
-			wantInjected: true,
-		},
-		{
-			name:        "explicit auto",
-			path:        "/v1/chat/completions",
-			body:        `{"model":"muse-spark-1.3","messages":[],"tool_choice":"auto"}`,
-			wantChoice:  "auto",
-			wantPresent: true,
-		},
-		{
-			name: "named choice omitted",
-			path: "/v1/chat/completions",
-			body: `{"model":"muse-spark-1.3","messages":[],"tool_choice":{"type":"function","function":{"name":"lookup"}}}`,
-		},
-		{
-			name:        "direct responses auto retained with complete quartet",
-			path:        "/v1/responses",
-			body:        `{"model":"other","tools":` + quartet + `,"tool_choice":"auto"}`,
-			wantChoice:  "auto",
-			wantPresent: true,
-		},
-		{
-			name: "direct responses none removed with complete quartet",
-			path: "/v1/responses",
-			body: `{"model":"other","tools":` + quartet + `,"tool_choice":"none"}`,
-		},
-		{
-			name: "direct responses required removed with complete quartet",
-			path: "/v1/responses",
-			body: `{"model":"other","tools":` + quartet + `,"tool_choice":"required"}`,
-		},
-		{
-			name: "direct responses named choice removed with complete quartet",
-			path: "/v1/responses",
-			body: `{"model":"other","tools":` + quartet + `,"tool_choice":{"type":"function","function":{"name":"lookup"}}}`,
-		},
-		{
-			name: "direct responses non-string choice removed with complete quartet",
-			path: "/v1/responses",
-			body: `{"model":"other","tools":` + quartet + `,"tool_choice":true}`,
-		},
-		{
-			name: "direct responses null choice removed with complete quartet",
-			path: "/v1/responses",
-			body: `{"model":"other","tools":` + quartet + `,"tool_choice":null}`,
-		},
-		{
-			name: "direct responses case-variant auto removed with complete quartet",
-			path: "/v1/responses",
-			body: `{"model":"other","tools":` + quartet + `,"tool_choice":"AUTO"}`,
-		},
+		{name: "chat tool-less injects captured tools and disables choice", path: "/v1/chat/completions", body: `{"model":"gpt-4o","messages":[]}`, wantChoice: "none", wantPresent: true, wantNames: wantNames, wantNested: true},
+		{name: "chat empty tools injects and preserves explicit choice", path: "/v1/chat/completions", body: `{"model":"gpt-4o","messages":[],"tools":[],"tool_choice":"required"}`, wantChoice: "required", wantPresent: true, wantNames: wantNames, wantNested: true},
+		{name: "chat caller tools and choice untouched", path: "/v1/chat/completions", body: `{"model":"gpt-4o","messages":[],"tools":` + callerChatTools + `,"tool_choice":"none"}`, wantChoice: "none", wantPresent: true, wantNames: []string{"lookup"}, wantNested: true, wantToolsJSON: callerChatTools},
+		{name: "Responses tool-less injects flat tools and leaves choice unpinned", path: "/v1/responses", body: `{"model":"muse-spark-1.3","input":"hello"}`, wantNames: wantNames},
+		{name: "Responses empty tools injects and preserves choice", path: "/v1/responses", body: `{"model":"muse-spark-1.3","input":"hello","tools":[],"tool_choice":"required"}`, wantChoice: "required", wantPresent: true, wantNames: wantNames},
+		{name: "Responses caller tools and choice untouched", path: "/v1/responses", body: `{"model":"muse-spark-1.3","input":"hello","tools":` + callerTools + `,"tool_choice":"none"}`, wantChoice: "none", wantPresent: true, wantNames: []string{"lookup"}, wantToolsJSON: callerTools},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -296,20 +234,108 @@ func TestProxyHandlerResponsesToolChoiceSanitization(t *testing.T) {
 					t.Error(err)
 				}
 				upstreamBody = decodeJSON(t, body)
+				if strings.Contains(r.URL.Path, "/v1/responses") {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, sampleResponsesSSE(t))
+					return
+				}
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = io.WriteString(w, `{}`)
 			}))
 			defer upstream.Close()
 			request := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body))
 			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Accept", "text/event-stream")
 			w := httptest.NewRecorder()
 			proxyHandler(upstream.URL, upstream.Client(), &idMint{}).ServeHTTP(w, request)
+			if w.Code != http.StatusOK {
+				t.Fatalf("proxy response = %d %q", w.Code, w.Body.String())
+			}
 			choice, exists := upstreamBody["tool_choice"]
 			if exists != tt.wantPresent || choice != tt.wantChoice {
 				t.Fatalf("upstream tool_choice = %#v, present=%t; want %#v, present=%t", choice, exists, tt.wantChoice, tt.wantPresent)
 			}
-			if tt.wantInjected {
-				assertFlatQuartet(t, upstreamBody["tools"])
+			tools := array(t, upstreamBody["tools"])
+			if len(tools) != len(tt.wantNames) {
+				t.Fatalf("upstream tools = %#v, want %v tools", tools, tt.wantNames)
+			}
+			for i, value := range tools {
+				tool := object(t, value)
+				if tool["type"] != "function" {
+					t.Fatalf("upstream tool %d has type %#v", i, tool["type"])
+				}
+				if tt.wantNested {
+					tool = object(t, tool["function"])
+				}
+				if tool["name"] != tt.wantNames[i] {
+					t.Fatalf("upstream tool %d name = %#v, want %q", i, tool["name"], tt.wantNames[i])
+				}
+			}
+			if tt.wantToolsJSON != "" {
+				wantTools := array(t, decodeJSON(t, []byte(`{"tools":`+tt.wantToolsJSON+`}`))["tools"])
+				if !reflect.DeepEqual(tools, wantTools) {
+					t.Fatalf("upstream tools = %#v, want caller tools unchanged %#v", tools, wantTools)
+				}
+			}
+		})
+	}
+}
+
+func TestProxyHandlerInferenceNormalizationPreservesWireFormats(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		upstreamPath string
+		path         string
+		body         string
+		wantNested   bool
+		wantNames    []string
+		wantChoice   any
+	}{
+		{name: "inference OpenAI Chat", upstreamPath: "/inference/openai", path: "/v1/chat/completions", body: `{"model":"gpt-4o","messages":[],"tool_choice":"required","tools":[{"type":"function","function":{"name":"bash","parameters":{"type":"string"}}},{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`, wantNested: true, wantNames: []string{"bash", "lookup", "glob", "grep", "read"}, wantChoice: "required"},
+		{name: "inference Anthropic Responses", upstreamPath: "/inference/anthropic", path: "/v1/responses", body: `{"model":"muse-spark-1.3","input":"hi","tools":[{"type":"function","name":"bash","parameters":{"type":"string"}},{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":"required"}`, wantNames: []string{"bash", "lookup", "glob", "grep", "read"}, wantChoice: "required"},
+		{name: "inference Google Chat", upstreamPath: "/inference/google", path: "/v1/chat/completions", body: `{"model":"gpt-4o","messages":[],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`, wantNested: true, wantNames: []string{"lookup", "bash", "glob", "grep", "read"}},
+		{name: "legacy upstream keeps client tools", upstreamPath: "/zen/v1", path: "/zen/v1/chat/completions", body: `{"model":"gpt-4o","messages":[],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`, wantNested: true, wantNames: []string{"lookup"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var upstreamBody map[string]any
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				payload, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Error(err)
+				}
+				upstreamBody = decodeJSON(t, payload)
+				if strings.Contains(r.URL.Path, "responses") {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, sampleResponsesSSE(t))
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{}`)
+			}))
+			defer upstream.Close()
+			request := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Accept", "text/event-stream")
+			w := httptest.NewRecorder()
+			proxyHandler(upstream.URL+tt.upstreamPath, upstream.Client(), &idMint{}).ServeHTTP(w, request)
+			if w.Code != http.StatusOK {
+				t.Fatalf("proxy response = %d %q", w.Code, w.Body.String())
+			}
+			tools := array(t, upstreamBody["tools"])
+			if len(tools) != len(tt.wantNames) {
+				t.Fatalf("upstream tools count = %d, want %d (%#v)", len(tools), len(tt.wantNames), tools)
+			}
+			for i, value := range tools {
+				tool := object(t, value)
+				if tt.wantNested {
+					tool = object(t, tool["function"])
+				}
+				if tool["name"] != tt.wantNames[i] {
+					t.Errorf("tool %d name = %#v, want %q", i, tool["name"], tt.wantNames[i])
+				}
+			}
+			if upstreamBody["tool_choice"] != tt.wantChoice {
+				t.Errorf("tool_choice = %#v, want %#v", upstreamBody["tool_choice"], tt.wantChoice)
 			}
 		})
 	}
@@ -384,7 +410,7 @@ func TestNormalizeAndClassifyModels(t *testing.T) {
 
 func TestWriteResponsesAsChatFixture(t *testing.T) {
 	w := httptest.NewRecorder()
-	status, retryable := writeResponsesAsChat(w, responses(sampleResponsesSSE(t)), "muse-spark-1.3", true, &responseReplayState{})
+	status, retryable := writeResponsesAsChat(w, responses(sampleResponsesSSE(t)), "muse-spark-1.3", true, &responseReplayState{}, toolCallFilter{})
 	if retryable || status != http.StatusOK || w.Code != http.StatusOK {
 		t.Fatalf("status = %d, recorder = %d, want 200", status, w.Code)
 	}
@@ -428,7 +454,7 @@ func TestWriteResponsesAsChatFunctionCallsAndStableIndices(t *testing.T) {
 		`data: {"type":"response.completed","response":{"id":"resp_calls","created_at":123,"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}`, "",
 	}, "\n")
 	w := httptest.NewRecorder()
-	status, retryable := writeResponsesAsChat(w, responses(stream), "muse-spark", true, &responseReplayState{})
+	status, retryable := writeResponsesAsChat(w, responses(stream), "muse-spark", true, &responseReplayState{}, toolCallFilter{})
 	if retryable || status != http.StatusOK || w.Code != http.StatusOK {
 		t.Fatalf("status = %d, recorder = %d", status, w.Code)
 	}
@@ -468,7 +494,7 @@ func TestWriteResponsesAsChatFunctionCallsAndStableIndices(t *testing.T) {
 func TestWriteResponsesAsChatFailure(t *testing.T) {
 	stream := "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"upstream exploded\"}}}\n\n"
 	w := httptest.NewRecorder()
-	status, retryable := writeResponsesAsChat(w, responses(stream), "muse-spark", true, &responseReplayState{})
+	status, retryable := writeResponsesAsChat(w, responses(stream), "muse-spark", true, &responseReplayState{}, toolCallFilter{})
 	if retryable || status != http.StatusOK || w.Code != http.StatusOK {
 		t.Fatalf("streaming failure status = %d, recorder = %d", status, w.Code)
 	}
@@ -480,7 +506,7 @@ func TestWriteResponsesAsChatFailure(t *testing.T) {
 
 func TestWriteResponsesAsChatNonStreaming(t *testing.T) {
 	w := httptest.NewRecorder()
-	status, retryable := writeResponsesAsChat(w, responses(sampleResponsesSSE(t)), "client-model", false, &responseReplayState{})
+	status, retryable := writeResponsesAsChat(w, responses(sampleResponsesSSE(t)), "client-model", false, &responseReplayState{}, toolCallFilter{})
 	if retryable || status != http.StatusOK || w.Code != http.StatusOK {
 		t.Fatalf("status = %d, recorder = %d", status, w.Code)
 	}
@@ -506,7 +532,7 @@ func TestWriteResponsesAsChatNonStreamingToolCalls(t *testing.T) {
 		`data: {"type":"response.completed","response":{"id":"resp_tool","created_at":123,"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`, "",
 	}, "\n")
 	w := httptest.NewRecorder()
-	status, retryable := writeResponsesAsChat(w, responses(stream), "muse-spark", false, &responseReplayState{})
+	status, retryable := writeResponsesAsChat(w, responses(stream), "muse-spark", false, &responseReplayState{}, toolCallFilter{})
 	if retryable || status != http.StatusOK || w.Code != http.StatusOK {
 		t.Fatalf("status = %d, recorder = %d", status, w.Code)
 	}
@@ -556,7 +582,7 @@ func TestProxyHandlerMuseRoutingAndJevRejection(t *testing.T) {
 		if converted["stream"] != true || converted["instructions"] != "instructions" {
 			t.Fatalf("upstream body missing Responses fields: %#v", converted)
 		}
-		assertFlatQuartet(t, converted["tools"])
+		assertHasToolNames(t, converted["tools"], "bash", "edit", "glob", "grep", "read", "write")
 		if !strings.HasSuffix(w.Body.String(), "data: [DONE]\n\n") {
 			t.Fatalf("client response was not chat SSE ending in [DONE]: %q", w.Body.String())
 		}
@@ -608,13 +634,7 @@ func TestProxyHandlerUnrelatedModelPassesThrough(t *testing.T) {
 	if upstreamBody["model"] != "gpt-4o" || upstreamBody["stream"] != true {
 		t.Fatalf("chat request should force stream true upstream: %#v", upstreamBody)
 	}
-	tools := array(t, upstreamBody["tools"])
-	if len(tools) != 4 || object(t, tools[0])["function"] == nil {
-		t.Fatalf("ordinary chat pass-through should retain nested quartet augmentation: %#v", tools)
-	}
-	if upstreamBody["tool_choice"] != "none" {
-		t.Fatalf("chat wire tool_choice = %#v, want none", upstreamBody["tool_choice"])
-	}
+	assertHasNestedToolNames(t, upstreamBody["tools"], "bash", "edit", "glob", "grep", "read", "write")
 	if w.Code != http.StatusOK || w.Body.String() != `{"ok":true}` {
 		t.Fatalf("pass-through response = %d %q", w.Code, w.Body.String())
 	}
@@ -656,7 +676,7 @@ func TestProxyHandlerMuseEndToEnd(t *testing.T) {
 	if upstreamRequest["stream"] != true || upstreamRequest["instructions"] != "be concise" {
 		t.Fatalf("upstream Responses request = %#v", upstreamRequest)
 	}
-	assertFlatQuartet(t, upstreamRequest["tools"])
+	assertHasFlatToolNames(t, upstreamRequest["tools"], "bash", "edit", "glob", "grep", "read", "write")
 	if w.Code != http.StatusOK || !strings.HasPrefix(w.Header().Get("Content-Type"), "text/event-stream") {
 		t.Fatalf("client response headers = %d %v", w.Code, w.Header())
 	}
@@ -713,22 +733,282 @@ func TestProxyHandlerMuseNonStreaming(t *testing.T) {
 	}
 }
 
-func assertFlatQuartet(t *testing.T, value any) {
-	t.Helper()
-	tools := array(t, value)
-	seen := make(map[string]int)
-	for _, item := range tools {
-		tool := object(t, item)
-		if tool["type"] != "function" || tool["function"] != nil {
-			t.Fatalf("Responses tool is not flat: %#v", tool)
-		}
-		if name, ok := tool["name"].(string); ok {
-			seen[name]++
+func TestProxyHandlerInjectedToolCallsAreFiltered(t *testing.T) {
+	for _, responsesWire := range []bool{false, true} {
+		for _, streaming := range []bool{false, true} {
+			name := "chat"
+			path := "/v1/chat/completions"
+			model := "gpt-4o"
+			upstreamEvent := "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]}}]}\n\n" +
+				"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+				"data: [DONE]\n\n"
+			if responsesWire {
+				name = "responses"
+				path = "/v1/responses"
+				model = "muse-spark-1.3"
+				upstreamEvent = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_filter\",\"created_at\":123,\"output\":[]}}\n\n" +
+					"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"item-1\",\"call_id\":\"call-1\",\"name\":\"bash\",\"arguments\":\"{}\"}}\n\n" +
+					"data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"item-1\",\"delta\":\"{}\"}\n\n" +
+					"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_filter\",\"created_at\":123,\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"id\":\"item-1\",\"call_id\":\"call-1\",\"name\":\"bash\",\"arguments\":\"{}\"},{\"type\":\"message\",\"id\":\"msg-1\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}]}}\n\n" +
+					"data: [DONE]\n\n"
+			}
+			t.Run(name+"/stream="+strconv.FormatBool(streaming), func(t *testing.T) {
+				setStabilityTestKnobs(t)
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, upstreamEvent)
+				}))
+				defer upstream.Close()
+				body := `{"model":"` + model + `","stream":` + strconv.FormatBool(streaming) + `,"messages":[{"role":"user","content":"run it"}]}`
+				if responsesWire {
+					body = `{"model":"` + model + `","stream":` + strconv.FormatBool(streaming) + `,"input":"run it"}`
+				}
+				request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+				request.Header.Set("Content-Type", "application/json")
+				if streaming {
+					request.Header.Set("Accept", "text/event-stream")
+				}
+				w := httptest.NewRecorder()
+				proxyHandler(upstream.URL, upstream.Client(), &idMint{}).ServeHTTP(w, request)
+				if w.Code != http.StatusOK {
+					t.Fatalf("proxy response = %d %q", w.Code, w.Body.String())
+				}
+				if responsesWire {
+					var payloads []map[string]any
+					if streaming {
+						payloads = ssePayloads(t, w.Body.String())
+						if !strings.HasSuffix(w.Body.String(), "data: [DONE]\n\n") {
+							t.Fatalf("Responses stream lacks terminal marker: %q", w.Body.String())
+						}
+					} else {
+						payloads = []map[string]any{decodeJSON(t, w.Body.Bytes())}
+					}
+					if strings.Contains(w.Body.String(), "function_call") {
+						t.Fatalf("injected Responses tool call leaked: %q", w.Body.String())
+					}
+					last := payloads[len(payloads)-1]
+					response, ok := last["response"].(map[string]any)
+					if !ok {
+						response = last
+					}
+					output := array(t, response["output"])
+					if len(output) != 1 || object(t, output[0])["type"] != "message" {
+						t.Fatalf("Responses output after filtering = %#v", output)
+					}
+					return
+				}
+				var completion map[string]any
+				if streaming {
+					for _, payload := range ssePayloads(t, w.Body.String()) {
+						if choices, ok := payload["choices"].([]any); ok && len(choices) > 0 {
+							completion = payload
+						}
+					}
+					if !strings.HasSuffix(w.Body.String(), "data: [DONE]\n\n") {
+						t.Fatalf("chat stream lacks terminal marker: %q", w.Body.String())
+					}
+				} else {
+					completion = decodeJSON(t, w.Body.Bytes())
+				}
+				choice := object(t, array(t, completion["choices"])[0])
+				if choice["finish_reason"] != "stop" {
+					t.Fatalf("finish_reason = %#v, want stop; completion=%#v", choice["finish_reason"], completion)
+				}
+				messageKey := "message"
+				if streaming {
+					messageKey = "delta"
+				}
+				message := object(t, choice[messageKey])
+				if _, exists := message["tool_calls"]; exists {
+					t.Fatalf("injected chat tool call leaked: %#v", message)
+				}
+			})
 		}
 	}
-	for _, name := range []string{"bash", "glob", "grep", "read"} {
-		if seen[name] != 1 {
-			t.Fatalf("flat tool %q appears %d times", name, seen[name])
+
+	t.Run("caller tool calls remain", func(t *testing.T) {
+		setStabilityTestKnobs(t)
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]}}]}\n\n")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		}))
+		defer upstream.Close()
+		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4o","stream":false,"messages":[],"tools":[{"type":"function","function":{"name":"bash","parameters":{"type":"object"}}}]}`))
+		request.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		proxyHandler(upstream.URL, upstream.Client(), &idMint{}).ServeHTTP(w, request)
+		completion := decodeJSON(t, w.Body.Bytes())
+		choice := object(t, array(t, completion["choices"])[0])
+		calls := array(t, object(t, choice["message"])["tool_calls"])
+		if len(calls) != 1 || choice["finish_reason"] != "tool_calls" {
+			t.Fatalf("caller tool call was modified: %#v", choice)
+		}
+		function := object(t, object(t, calls[0])["function"])
+		if function["name"] != "bash" {
+			t.Fatalf("caller tool call = %#v, want caller-supplied bash", function)
+		}
+	})
+
+	t.Run("normalized core call is filtered", func(t *testing.T) {
+		setStabilityTestKnobs(t)
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"core\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}},{\"index\":1,\"id\":\"custom\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}\n\n")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		}))
+		defer upstream.Close()
+		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4o","stream":false,"messages":[],"tools":[{"type":"function","function":{"name":"bash","parameters":{"type":"object"}}},{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`))
+		request.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		proxyHandler(upstream.URL+"/inference/openai", upstream.Client(), &idMint{}).ServeHTTP(w, request)
+		completion := decodeJSON(t, w.Body.Bytes())
+		choice := object(t, array(t, completion["choices"])[0])
+		calls := array(t, object(t, choice["message"])["tool_calls"])
+		if len(calls) != 1 {
+			t.Fatalf("tool calls after normalized-core filtering = %#v, want only lookup", calls)
+		}
+		if name := stringValue(object(t, object(t, calls[0])["function"])["name"]); name != "lookup" {
+			t.Fatalf("remaining tool call = %q, want lookup", name)
+		}
+	})
+}
+
+func TestProxyHandlerFiltersNormalizedResponsesCoreCalls(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_norm\",\"created_at\":123,\"output\":[]}}\n\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_norm\",\"created_at\":123,\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"id\":\"core\",\"call_id\":\"core\",\"name\":\"bash\",\"arguments\":\"{}\"},{\"type\":\"function_call\",\"id\":\"custom\",\"call_id\":\"custom\",\"name\":\"lookup\",\"arguments\":\"{}\"},{\"type\":\"message\",\"id\":\"msg\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}]}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"muse-spark-1.3","input":"run","stream":true,"tools":[{"type":"function","name":"bash","parameters":{"type":"string"}},{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "text/event-stream")
+	w := httptest.NewRecorder()
+	proxyHandler(upstream.URL+"/inference/anthropic", upstream.Client(), &idMint{}).ServeHTTP(w, request)
+	if w.Code != http.StatusOK {
+		t.Fatalf("proxy response = %d %q", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), `"name":"bash"`) {
+		t.Fatalf("normalized Responses core call leaked: %q", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"name":"lookup"`) {
+		t.Fatalf("arbitrary Responses call was removed: %q", w.Body.String())
+	}
+}
+
+func TestProxyHandlerFiltersNormalizedResponsesFallbackCalls(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/v1/chat/completions") {
+			t.Errorf("upstream path = %q, want suffix /v1/chat/completions", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"core\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}},{\"index\":1,\"id\":\"custom\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-4o","input":"run","stream":true,"tools":[{"type":"function","name":"bash","parameters":{"type":"string"}},{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "text/event-stream")
+	w := httptest.NewRecorder()
+	proxyHandler(upstream.URL+"/inference/openai", upstream.Client(), &idMint{}).ServeHTTP(w, request)
+	if w.Code != http.StatusOK {
+		t.Fatalf("proxy response = %d %q", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), `"name":"bash"`) {
+		t.Fatalf("normalized Responses fallback core call leaked: %q", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"name":"lookup"`) {
+		t.Fatalf("arbitrary Responses fallback call was removed: %q", w.Body.String())
+	}
+}
+func TestFilterToolCallsInJSON(t *testing.T) {
+	for _, injectedName := range []string{"bash", "edit", "glob", "grep", "read", "write"} {
+		t.Run(injectedName, func(t *testing.T) {
+			filter := toolCallFilter{injected: map[string]bool{injectedName: true}}
+			chat := []byte(`{"choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[{"function":{"name":"` + injectedName + `"}},{"function":{"name":"lookup"}}]}}]}`)
+			filtered, changed := filterToolCallsInJSON(chat, filter)
+			if !changed {
+				t.Fatal("chat response was not filtered")
+			}
+			chatResponse := decodeJSON(t, filtered)
+			chatChoice := object(t, array(t, chatResponse["choices"])[0])
+			chatCalls := array(t, object(t, chatChoice["message"])["tool_calls"])
+			if len(chatCalls) != 1 || stringValue(object(t, object(t, chatCalls[0])["function"])["name"]) != "lookup" || chatChoice["finish_reason"] != "tool_calls" {
+				t.Fatalf("filtered chat response = %#v", chatChoice)
+			}
+
+			responses := []byte(`{"output":[{"type":"function_call","name":"` + injectedName + `"},{"type":"function_call","name":"lookup"},{"type":"message","content":[]}]}`)
+			filtered, changed = filterToolCallsInJSON(responses, filter)
+			if !changed {
+				t.Fatal("Responses payload was not filtered")
+			}
+			responsesPayload := decodeJSON(t, filtered)
+			output := array(t, responsesPayload["output"])
+			if len(output) != 2 || object(t, output[0])["name"] != "lookup" || object(t, output[1])["type"] != "message" {
+				t.Fatalf("filtered Responses output = %#v", output)
+			}
+		})
+	}
+}
+
+func assertOnlyFlatTool(t *testing.T, value any, wantName string) {
+	t.Helper()
+	tools := array(t, value)
+	if len(tools) != 1 {
+		t.Fatalf("tools = %#v, want exactly one", tools)
+	}
+	tool := object(t, tools[0])
+	if tool["name"] != wantName {
+		t.Fatalf("tool name = %#v, want %q", tool["name"], wantName)
+	}
+}
+
+func assertOnlyNestedTool(t *testing.T, value any, wantName string) {
+	t.Helper()
+	tools := array(t, value)
+	if len(tools) != 1 {
+		t.Fatalf("tools = %#v, want exactly one", tools)
+	}
+	tool := object(t, object(t, tools[0])["function"])
+	if tool["name"] != wantName {
+		t.Fatalf("tool name = %#v, want %q", tool["name"], wantName)
+	}
+}
+
+func assertHasFlatToolNames(t *testing.T, value any, want ...string) {
+	t.Helper()
+	assertToolNames(t, value, false, want)
+}
+
+func assertHasNestedToolNames(t *testing.T, value any, want ...string) {
+	t.Helper()
+	assertToolNames(t, value, true, want)
+}
+
+func assertHasToolNames(t *testing.T, value any, want ...string) {
+	t.Helper()
+	assertToolNames(t, value, false, want)
+}
+
+func assertToolNames(t *testing.T, value any, nested bool, want []string) {
+	t.Helper()
+	tools := array(t, value)
+	got := make(map[string]bool, len(tools))
+	for _, raw := range tools {
+		tool := object(t, raw)
+		if nested {
+			tool = object(t, tool["function"])
+		}
+		got[stringValue(tool["name"])] = true
+	}
+	for _, name := range want {
+		if !got[name] {
+			t.Fatalf("tools = %#v, missing %q", tools, name)
 		}
 	}
 }

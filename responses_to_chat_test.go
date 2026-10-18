@@ -256,7 +256,7 @@ data: [DONE]
 
 `
 	recorder := httptest.NewRecorder()
-	status, retryable := writeChatStreamAsResponses(recorder, strings.NewReader(upstream), "longcat-2.5-preview-free")
+	status, retryable := writeChatStreamAsResponses(recorder, strings.NewReader(upstream), "longcat-2.5-preview-free", toolCallFilter{})
 	if status != http.StatusOK || retryable {
 		t.Fatalf("status/retryable = (%d, %t)", status, retryable)
 	}
@@ -332,7 +332,7 @@ data: [DONE]
 
 `
 	recorder := httptest.NewRecorder()
-	status, retryable := writeChatStreamAsResponses(recorder, strings.NewReader(upstream), "longcat-2.5-preview-free")
+	status, retryable := writeChatStreamAsResponses(recorder, strings.NewReader(upstream), "longcat-2.5-preview-free", toolCallFilter{})
 	if status != http.StatusOK || retryable {
 		t.Fatalf("status/retryable = (%d, %t)", status, retryable)
 	}
@@ -457,16 +457,16 @@ func TestProxyHandlerResponsesChatOnlyStreaming(t *testing.T) {
 	var mu sync.Mutex
 	var paths []string
 	var upstreamStream any
+	var upstreamChatBody map[string]any
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		paths = append(paths, r.URL.Path)
 		body, err := io.ReadAll(r.Body)
-		mu.Unlock()
 		if err != nil {
 			t.Error(err)
 		}
 		decoded := decodeJSON(t, body)
 		mu.Lock()
+		paths = append(paths, r.URL.RequestURI())
+		upstreamChatBody = decoded
 		upstreamStream = decoded["stream"]
 		mu.Unlock()
 		if r.URL.Path != "/v1/chat/completions" {
@@ -479,7 +479,7 @@ func TestProxyHandlerResponsesChatOnlyStreaming(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	request := responsesTestRequest("/v1/responses", `{"model":"longcat-2.5-preview-free","stream":true,"input":"Reply with exactly: BENCH"}`)
+	request := responsesTestRequest("/v1/responses?trace=stream%2F1", `{"model":"longcat-2.5-preview-free","stream":true,"input":"Reply with exactly: BENCH"}`)
 	w := httptest.NewRecorder()
 	proxyHandler(upstream.URL, upstream.Client(), &idMint{}).ServeHTTP(w, request)
 	if w.Code != http.StatusOK {
@@ -489,13 +489,14 @@ func TestProxyHandlerResponsesChatOnlyStreaming(t *testing.T) {
 		t.Fatalf("client content type = %q", got)
 	}
 	mu.Lock()
-	if len(paths) != 1 || paths[0] != "/v1/chat/completions" {
-		t.Fatalf("upstream paths = %v, want single /v1/chat/completions", paths)
+	if len(paths) != 1 || paths[0] != "/v1/chat/completions?trace=stream%2F1" {
+		t.Fatalf("upstream paths = %v, want the Chat route with query preserved", paths)
 	}
 	if upstreamStream != true {
 		t.Fatalf("upstream stream = %#v, want true", upstreamStream)
 	}
 	mu.Unlock()
+	assertHasNestedToolNames(t, upstreamChatBody["tools"], "bash", "edit", "glob", "grep", "read", "write")
 	body := w.Body.String()
 	wantOrder := []string{
 		"response.created",
@@ -537,7 +538,7 @@ func TestProxyHandlerResponsesChatOnlyNonStreaming(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		mu.Lock()
-		paths = append(paths, r.URL.Path)
+		paths = append(paths, r.URL.RequestURI())
 		mu.Unlock()
 		decoded := decodeJSON(t, body)
 		if decoded["stream"] != true {
@@ -553,7 +554,7 @@ func TestProxyHandlerResponsesChatOnlyNonStreaming(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	request := responsesTestRequest("/v1/responses", `{"model":"longcat-2.5-preview-free","stream":false,"input":"Reply with exactly: BENCH"}`)
+	request := responsesTestRequest("/v1/responses?trace=nonstream%2F1", `{"model":"longcat-2.5-preview-free","stream":false,"input":"Reply with exactly: BENCH"}`)
 	w := httptest.NewRecorder()
 	proxyHandler(upstream.URL, upstream.Client(), &idMint{}).ServeHTTP(w, request)
 	if w.Code != http.StatusOK {
@@ -563,8 +564,8 @@ func TestProxyHandlerResponsesChatOnlyNonStreaming(t *testing.T) {
 		t.Fatalf("client content type = %q", got)
 	}
 	mu.Lock()
-	if len(paths) != 1 || paths[0] != "/v1/chat/completions" {
-		t.Fatalf("upstream paths = %v", paths)
+	if len(paths) != 1 || paths[0] != "/v1/chat/completions?trace=nonstream%2F1" {
+		t.Fatalf("upstream paths = %v, want the Chat route with query preserved", paths)
 	}
 	mu.Unlock()
 	response := decodeJSON(t, w.Body.Bytes())
@@ -588,12 +589,23 @@ func TestProxyHandlerResponsesChatOnlyNonStreaming(t *testing.T) {
 
 func TestProxyHandlerResponsesProtocolFallback(t *testing.T) {
 	setStabilityTestKnobs(t)
-	var mu sync.Mutex
 	var paths []string
+	var mu sync.Mutex
+	var chatBody, nativeBody map[string]any
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+		decoded := decodeJSON(t, body)
 		mu.Lock()
-		paths = append(paths, r.URL.Path)
+		paths = append(paths, r.URL.RequestURI())
+		switch r.URL.Path {
+		case "/v1/chat/completions":
+			chatBody = decoded
+		case "/v1/responses":
+			nativeBody = decoded
+		}
 		mu.Unlock()
 		switch r.URL.Path {
 		case "/v1/chat/completions":
@@ -611,7 +623,7 @@ func TestProxyHandlerResponsesProtocolFallback(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	request := responsesTestRequest("/v1/responses", `{"model":"longcat-2.5-preview-free","stream":true,"input":"hi"}`)
+	request := responsesTestRequest("/v1/responses?trace=fallback%2F1", `{"model":"longcat-2.5-preview-free","stream":true,"input":"hi","tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":"required"}`)
 	w := httptest.NewRecorder()
 	proxyHandler(upstream.URL, upstream.Client(), &idMint{}).ServeHTTP(w, request)
 	if w.Code != http.StatusOK {
@@ -620,8 +632,22 @@ func TestProxyHandlerResponsesProtocolFallback(t *testing.T) {
 	mu.Lock()
 	seen := strings.Join(paths, ",")
 	mu.Unlock()
-	if seen != "/v1/chat/completions,/v1/responses" {
-		t.Fatalf("upstream paths = %q, want chat-first then responses exactly once each", seen)
+	wantPaths := "/v1/chat/completions?trace=fallback%2F1,/v1/responses?trace=fallback%2F1"
+	if seen != wantPaths {
+		t.Fatalf("upstream paths = %q, want chat-first then native Responses with query preserved", seen)
+	}
+	wantChatTools := []any{map[string]any{"type": "function", "function": map[string]any{"name": "lookup", "parameters": map[string]any{"type": "object"}}}}
+	wantNativeTools := []any{map[string]any{"type": "function", "name": "lookup", "parameters": map[string]any{"type": "object"}}}
+	if !reflect.DeepEqual(chatBody["tools"].([]any)[:1], wantChatTools) || !reflect.DeepEqual(nativeBody["tools"].([]any)[:1], wantNativeTools) {
+		t.Fatalf("caller tools changed across fallback: chat=%#v native=%#v", chatBody["tools"], nativeBody["tools"])
+	}
+	assertHasNestedToolNames(t, chatBody["tools"], "lookup")
+	assertHasFlatToolNames(t, nativeBody["tools"], "lookup")
+	if chatBody["tool_choice"] != "required" {
+		t.Fatalf("chat bridge tool_choice = %#v, want caller choice required", chatBody["tool_choice"])
+	}
+	if nativeBody["tool_choice"] != "required" {
+		t.Fatalf("native fallback tool_choice = %#v, want caller choice required", nativeBody["tool_choice"])
 	}
 	body := w.Body.String()
 	if !strings.Contains(body, "response.completed") {
@@ -645,7 +671,7 @@ func TestProxyHandlerResponsesMuseStaysNative(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.ReadAll(r.Body)
 		mu.Lock()
-		paths = append(paths, r.URL.Path)
+		paths = append(paths, r.URL.RequestURI())
 		mu.Unlock()
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, `data: {"choices":[{"delta":{"content":"muse"}}]}`+"\n\n")
@@ -662,13 +688,13 @@ func TestProxyHandlerResponsesMuseStaysNative(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	if len(paths) != 1 || paths[0] != "/v1/responses" {
-		t.Fatalf("upstream paths = %v, want single /v1/responses", paths)
+		t.Fatalf("upstream paths = %v, want single native OpenAI Responses route", paths)
 	}
 }
 
 func TestProxyHandlerResponsesToolRoundTrip(t *testing.T) {
 	setStabilityTestKnobs(t)
-	inbound := `{"model":"longcat-2.5-preview-free","stream":true,"input":[` +
+	inbound := `{"model":"longcat-2.5-preview-free","stream":true,"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"input":[` +
 		`{"type":"message","role":"user","content":"weather in Paris?"},` +
 		`{"type":"function_call","call_id":"call-1","name":"lookup","arguments":"{\"city\":\"Paris\"}"},` +
 		`{"type":"function_call_output","call_id":"call-1","output":"sunny"}]}`

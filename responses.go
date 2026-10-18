@@ -97,8 +97,7 @@ func buildResponsesRequest(chat map[string]any) map[string]any {
 	responses["input"] = input
 
 	tools, _ := chat["tools"].([]any)
-	flatTools := make([]any, 0, len(tools)+4)
-	present := make(map[string]bool)
+	flatTools := make([]any, 0, len(tools))
 	for _, raw := range tools {
 		tool, ok := raw.(map[string]any)
 		if !ok {
@@ -118,21 +117,21 @@ func buildResponsesRequest(chat map[string]any) map[string]any {
 			tool = flat
 		}
 		flatTools = append(flatTools, tool)
-		if tool["type"] == "function" {
-			if name, ok := tool["name"].(string); ok {
-				present[strings.ToLower(name)] = true
-			}
-		}
-	}
-	for _, name := range []string{"bash", "glob", "grep", "read"} {
-		if present[name] {
-			continue
-		}
-		flatTools = append(flatTools, map[string]any{"type": "function", "name": name, "description": quartetDescription, "parameters": map[string]any{"type": "object", "properties": map[string]any{}}})
 	}
 	responses["tools"] = flatTools
-	if choice, ok := chat["tool_choice"].(string); ok && choice == "auto" {
-		responses["tool_choice"] = choice
+	if len(tools) > 0 {
+		switch choice := chat["tool_choice"].(type) {
+		case string:
+			responses["tool_choice"] = choice
+		case map[string]any:
+			name := stringValue(choice["name"])
+			if function, ok := choice["function"].(map[string]any); ok && name == "" {
+				name = stringValue(function["name"])
+			}
+			if name != "" {
+				responses["tool_choice"] = map[string]any{"type": "function", "name": name}
+			}
+		}
 	}
 
 	for _, key := range []string{"temperature", "top_p", "max_tokens", "max_completion_tokens", "stop", "seed", "user", "parallel_tool_calls", "presence_penalty", "frequency_penalty"} {
@@ -237,17 +236,6 @@ func userInputItem(content any) (map[string]any, bool) {
 	}
 	return map[string]any{"type": "message", "role": "user", "content": parts}, true
 }
-func sanitizeResponsesToolChoice(body map[string]any) bool {
-	choice, exists := body["tool_choice"]
-	if !exists {
-		return false
-	}
-	if value, ok := choice.(string); ok && value == "auto" {
-		return false
-	}
-	delete(body, "tool_choice")
-	return true
-}
 
 type responseToolCall struct {
 	ID       string `json:"id"`
@@ -264,19 +252,20 @@ type responseReplayState struct {
 }
 
 type responseSSEState struct {
-	id          string
-	created     int64
-	roleSent    bool
-	anyToolCall bool
-	toolIndexes map[string]int
-	itemIndexes map[string]int
-	toolCalls   []*responseToolCall
-	text        strings.Builder
-	usage       map[string]any
-	finish      string
-	terminal    bool
-	failure     string
-	contentSent bool
+	id              string
+	created         int64
+	roleSent        bool
+	anyToolCall     bool
+	toolIndexes     map[string]int
+	itemIndexes     map[string]int
+	toolCalls       []*responseToolCall
+	hiddenToolCalls map[string]bool
+	text            strings.Builder
+	usage           map[string]any
+	finish          string
+	terminal        bool
+	failure         string
+	contentSent     bool
 }
 
 func newResponseSSEState() (*responseSSEState, error) {
@@ -284,10 +273,10 @@ func newResponseSSEState() (*responseSSEState, error) {
 	if _, err := rand.Read(random[:]); err != nil {
 		return nil, fmt.Errorf("generate response id: %w", err)
 	}
-	return &responseSSEState{id: "chatcmpl-" + hex.EncodeToString(random[:]), created: time.Now().Unix(), toolIndexes: make(map[string]int), itemIndexes: make(map[string]int)}, nil
+	return &responseSSEState{id: "chatcmpl-" + hex.EncodeToString(random[:]), created: time.Now().Unix(), toolIndexes: make(map[string]int), itemIndexes: make(map[string]int), hiddenToolCalls: make(map[string]bool)}, nil
 }
 
-func writeResponsesAsChat(w http.ResponseWriter, upstream *http.Response, model string, streaming bool, replay *responseReplayState) (int, bool) {
+func writeResponsesAsChat(w http.ResponseWriter, upstream *http.Response, model string, streaming bool, replay *responseReplayState, filter toolCallFilter) (int, bool) {
 	state, err := newResponseSSEState()
 	if err != nil {
 		return http.StatusBadGateway, false
@@ -357,10 +346,19 @@ func writeResponsesAsChat(w http.ResponseWriter, upstream *http.Response, model 
 				return sendRolePrelude(w, state, model, streaming, replay)
 			case "function_call":
 				callID, _ := item["call_id"].(string)
+				itemID, _ := item["id"].(string)
+				if filter.hides(stringValue(item["name"])) {
+					if callID != "" {
+						state.hiddenToolCalls[callID] = true
+					}
+					if itemID != "" {
+						state.hiddenToolCalls[itemID] = true
+					}
+					return nil
+				}
 				if callID == "" {
 					return nil
 				}
-				itemID, _ := item["id"].(string)
 				index := state.registerTool(callID, itemID, item["name"])
 				if streaming {
 					state.contentSent = true
@@ -384,6 +382,9 @@ func writeResponsesAsChat(w http.ResponseWriter, upstream *http.Response, model 
 			if callID == "" {
 				callID, _ = event["item_id"].(string)
 			}
+			if state.hiddenToolCalls[callID] {
+				return nil
+			}
 			index, ok := state.toolIndexes[callID]
 			if !ok {
 				index, ok = state.itemIndexes[callID]
@@ -396,6 +397,7 @@ func writeResponsesAsChat(w http.ResponseWriter, upstream *http.Response, model 
 				state.contentSent = true
 				return writeChatChunk(w, state, model, map[string]any{"tool_calls": []any{map[string]any{"index": index, "function": map[string]any{"arguments": data}}}}, nil, nil)
 			}
+
 		case "response.completed":
 			if streaming {
 				if err := writeChatChunk(w, state, model, map[string]any{}, state.finish, state.usage); err != nil {
@@ -536,6 +538,78 @@ func responseUsage(raw any) map[string]any {
 		}
 	}
 	return usage
+}
+
+func stripChatCompletionToolCalls(completion map[string]any, filter toolCallFilter) {
+	choices, _ := completion["choices"].([]any)
+	for _, rawChoice := range choices {
+		choice, _ := rawChoice.(map[string]any)
+		if choice == nil {
+			continue
+		}
+		removed := false
+		remaining := 0
+		for _, key := range []string{"message", "delta"} {
+			body, _ := choice[key].(map[string]any)
+			if body == nil {
+				continue
+			}
+			switch calls := body["tool_calls"].(type) {
+			case []any:
+				filtered := calls[:0]
+				for _, rawCall := range calls {
+					call, _ := rawCall.(map[string]any)
+					function, _ := call["function"].(map[string]any)
+					if call != nil && filter.hides(stringValue(function["name"])) {
+						removed = true
+						continue
+					}
+					filtered = append(filtered, rawCall)
+				}
+				if len(filtered) == 0 {
+					if len(calls) > 0 {
+						delete(body, "tool_calls")
+					}
+				} else {
+					body["tool_calls"] = filtered
+					remaining += len(filtered)
+				}
+			case []*responseToolCall:
+				filtered := calls[:0]
+				for _, call := range calls {
+					if call != nil && filter.hides(call.Function.Name) {
+						removed = true
+						continue
+					}
+					filtered = append(filtered, call)
+				}
+				if len(filtered) == 0 {
+					if len(calls) > 0 {
+						delete(body, "tool_calls")
+					}
+				} else {
+					body["tool_calls"] = filtered
+					remaining += len(filtered)
+				}
+			}
+		}
+		if removed && remaining == 0 && choice["finish_reason"] == "tool_calls" {
+			choice["finish_reason"] = "stop"
+		}
+	}
+}
+
+func stripResponsesToolCalls(response map[string]any, filter toolCallFilter) {
+	output, _ := response["output"].([]any)
+	filtered := output[:0]
+	for _, rawItem := range output {
+		item, _ := rawItem.(map[string]any)
+		if item != nil && item["type"] == "function_call" && filter.hides(stringValue(item["name"])) {
+			continue
+		}
+		filtered = append(filtered, rawItem)
+	}
+	response["output"] = filtered
 }
 
 func sendRolePrelude(w http.ResponseWriter, state *responseSSEState, model string, streaming bool, replay *responseReplayState) error {
