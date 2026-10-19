@@ -65,12 +65,13 @@ func TestUpstreamSessionHeadersPaired(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var gotSession, gotSessionID, gotAffinity, gotProject string
+			var gotSession, gotSessionID, gotAffinity, gotProject, gotPath string
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				gotSession = r.Header.Get("x-opencode-session")
 				gotSessionID = r.Header.Get("x-opencode-session-id")
 				gotAffinity = r.Header.Get("x-session-affinity")
 				gotProject = r.Header.Get("x-opencode-project")
+				gotPath = r.URL.RequestURI()
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = io.WriteString(w, `{"object":"list"}`)
 			}))
@@ -84,10 +85,13 @@ func TestUpstreamSessionHeadersPaired(t *testing.T) {
 				request = request.WithContext(context.WithValue(request.Context(), contextKey{}, contextSession))
 			}
 			recorder := httptest.NewRecorder()
-			proxyHandler(upstream.URL, upstream.Client(), &idMint{}).ServeHTTP(recorder, request)
+			proxyHandler(upstream.URL+"/inference", upstream.Client(), &idMint{}).ServeHTTP(recorder, request)
 
 			if recorder.Code != http.StatusOK {
 				t.Fatalf("client status = %d body %q", recorder.Code, recorder.Body.String())
+			}
+			if gotPath != "/inference/v1/models" {
+				t.Fatalf("upstream catalog path = %q, want /inference/v1/models", gotPath)
 			}
 			if gotSession == "" || gotSession != gotSessionID || gotSession != gotAffinity {
 				t.Fatalf("upstream session affinity headers = (%q, %q, %q), want equal non-empty values", gotSession, gotSessionID, gotAffinity)

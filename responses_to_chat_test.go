@@ -469,7 +469,7 @@ func TestProxyHandlerResponsesChatOnlyStreaming(t *testing.T) {
 		upstreamChatBody = decoded
 		upstreamStream = decoded["stream"]
 		mu.Unlock()
-		if r.URL.Path != "/v1/chat/completions" {
+		if r.URL.Path != "/inference/openai/v1/chat/completions" {
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = io.WriteString(w, `{"error":{"message":"ModelProtocolUnsupported"}}`)
 			return
@@ -481,7 +481,7 @@ func TestProxyHandlerResponsesChatOnlyStreaming(t *testing.T) {
 
 	request := responsesTestRequest("/v1/responses?trace=stream%2F1", `{"model":"longcat-2.5-preview-free","stream":true,"input":"Reply with exactly: BENCH"}`)
 	w := httptest.NewRecorder()
-	proxyHandler(upstream.URL, upstream.Client(), &idMint{}).ServeHTTP(w, request)
+	proxyHandler(upstream.URL+"/inference", upstream.Client(), &idMint{}).ServeHTTP(w, request)
 	if w.Code != http.StatusOK {
 		t.Fatalf("client status = %d body %q", w.Code, w.Body.String())
 	}
@@ -489,8 +489,8 @@ func TestProxyHandlerResponsesChatOnlyStreaming(t *testing.T) {
 		t.Fatalf("client content type = %q", got)
 	}
 	mu.Lock()
-	if len(paths) != 1 || paths[0] != "/v1/chat/completions?trace=stream%2F1" {
-		t.Fatalf("upstream paths = %v, want the Chat route with query preserved", paths)
+	if len(paths) != 1 || paths[0] != "/inference/openai/v1/chat/completions?trace=stream%2F1" {
+		t.Fatalf("upstream paths = %v, want mapped Chat route with query preserved", paths)
 	}
 	if upstreamStream != true {
 		t.Fatalf("upstream stream = %#v, want true", upstreamStream)
@@ -544,7 +544,7 @@ func TestProxyHandlerResponsesChatOnlyNonStreaming(t *testing.T) {
 		if decoded["stream"] != true {
 			t.Errorf("upstream stream = %#v, want forced true", decoded["stream"])
 		}
-		if r.URL.Path != "/v1/chat/completions" {
+		if r.URL.Path != "/inference/openai/v1/chat/completions" {
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = io.WriteString(w, `{"error":{"message":"ModelProtocolUnsupported"}}`)
 			return
@@ -556,7 +556,7 @@ func TestProxyHandlerResponsesChatOnlyNonStreaming(t *testing.T) {
 
 	request := responsesTestRequest("/v1/responses?trace=nonstream%2F1", `{"model":"longcat-2.5-preview-free","stream":false,"input":"Reply with exactly: BENCH"}`)
 	w := httptest.NewRecorder()
-	proxyHandler(upstream.URL, upstream.Client(), &idMint{}).ServeHTTP(w, request)
+	proxyHandler(upstream.URL+"/inference", upstream.Client(), &idMint{}).ServeHTTP(w, request)
 	if w.Code != http.StatusOK {
 		t.Fatalf("client status = %d body %q", w.Code, w.Body.String())
 	}
@@ -564,8 +564,8 @@ func TestProxyHandlerResponsesChatOnlyNonStreaming(t *testing.T) {
 		t.Fatalf("client content type = %q", got)
 	}
 	mu.Lock()
-	if len(paths) != 1 || paths[0] != "/v1/chat/completions?trace=nonstream%2F1" {
-		t.Fatalf("upstream paths = %v, want the Chat route with query preserved", paths)
+	if len(paths) != 1 || paths[0] != "/inference/openai/v1/chat/completions?trace=nonstream%2F1" {
+		t.Fatalf("upstream paths = %v, want mapped Chat route with query preserved", paths)
 	}
 	mu.Unlock()
 	response := decodeJSON(t, w.Body.Bytes())
@@ -601,18 +601,18 @@ func TestProxyHandlerResponsesProtocolFallback(t *testing.T) {
 		mu.Lock()
 		paths = append(paths, r.URL.RequestURI())
 		switch r.URL.Path {
-		case "/v1/chat/completions":
+		case "/inference/openai/v1/chat/completions":
 			chatBody = decoded
-		case "/v1/responses":
+		case "/inference/openai/v1/responses":
 			nativeBody = decoded
 		}
 		mu.Unlock()
 		switch r.URL.Path {
-		case "/v1/chat/completions":
+		case "/inference/openai/v1/chat/completions":
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = io.WriteString(w, `{"error":{"message":"ModelProtocolUnsupported"}}`)
-		case "/v1/responses":
+		case "/inference/openai/v1/responses":
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = io.WriteString(w, `data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_native00000000000000000000","object":"response","status":"in_progress","output":[]}}`+"\n\n")
 			_, _ = io.WriteString(w, `data: {"type":"response.completed","sequence_number":1,"response":{"id":"resp_native00000000000000000000","object":"response","status":"completed","output":[{"type":"message","id":"msg_native","role":"assistant","status":"completed","content":[{"type":"output_text","text":"native"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`+"\n\n")
@@ -625,16 +625,16 @@ func TestProxyHandlerResponsesProtocolFallback(t *testing.T) {
 
 	request := responsesTestRequest("/v1/responses?trace=fallback%2F1", `{"model":"longcat-2.5-preview-free","stream":true,"input":"hi","tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":"required"}`)
 	w := httptest.NewRecorder()
-	proxyHandler(upstream.URL, upstream.Client(), &idMint{}).ServeHTTP(w, request)
+	proxyHandler(upstream.URL+"/inference", upstream.Client(), &idMint{}).ServeHTTP(w, request)
 	if w.Code != http.StatusOK {
 		t.Fatalf("client status = %d body %q", w.Code, w.Body.String())
 	}
 	mu.Lock()
 	seen := strings.Join(paths, ",")
 	mu.Unlock()
-	wantPaths := "/v1/chat/completions?trace=fallback%2F1,/v1/responses?trace=fallback%2F1"
+	wantPaths := "/inference/openai/v1/chat/completions?trace=fallback%2F1,/inference/openai/v1/responses?trace=fallback%2F1"
 	if seen != wantPaths {
-		t.Fatalf("upstream paths = %q, want chat-first then native Responses with query preserved", seen)
+		t.Fatalf("upstream paths = %q, want mapped chat-first then native Responses with query preserved", seen)
 	}
 	wantChatTools := []any{map[string]any{"type": "function", "function": map[string]any{"name": "lookup", "parameters": map[string]any{"type": "object"}}}}
 	wantNativeTools := []any{map[string]any{"type": "function", "name": "lookup", "parameters": map[string]any{"type": "object"}}}
@@ -679,16 +679,16 @@ func TestProxyHandlerResponsesMuseStaysNative(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	request := responsesTestRequest("/v1/responses", `{"model":"muse-spark-1.3-contributor-free","stream":true,"input":"hi"}`)
+	request := responsesTestRequest("/v1/responses?trace=muse%2Fnative", `{"model":"muse-spark-1.3-contributor-free","stream":true,"input":"hi"}`)
 	w := httptest.NewRecorder()
-	proxyHandler(upstream.URL, upstream.Client(), &idMint{}).ServeHTTP(w, request)
+	proxyHandler(upstream.URL+"/inference", upstream.Client(), &idMint{}).ServeHTTP(w, request)
 	if w.Code != http.StatusOK {
 		t.Fatalf("client status = %d body %q", w.Code, w.Body.String())
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(paths) != 1 || paths[0] != "/v1/responses" {
-		t.Fatalf("upstream paths = %v, want single native OpenAI Responses route", paths)
+	if len(paths) != 1 || paths[0] != "/inference/openai/v1/responses?trace=muse%2Fnative" {
+		t.Fatalf("upstream paths = %v, want single mapped native OpenAI Responses route with query preserved", paths)
 	}
 }
 
@@ -700,7 +700,9 @@ func TestProxyHandlerResponsesToolRoundTrip(t *testing.T) {
 		`{"type":"function_call_output","call_id":"call-1","output":"sunny"}]}`
 	var mu sync.Mutex
 	var upstreamBody map[string]any
+	var upstreamURI string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamURI = r.URL.RequestURI()
 		raw, _ := io.ReadAll(r.Body)
 		mu.Lock()
 		upstreamBody = decodeJSON(t, raw)
@@ -714,9 +716,12 @@ func TestProxyHandlerResponsesToolRoundTrip(t *testing.T) {
 
 	request := responsesTestRequest("/v1/responses", inbound)
 	w := httptest.NewRecorder()
-	proxyHandler(upstream.URL, upstream.Client(), &idMint{}).ServeHTTP(w, request)
+	proxyHandler(upstream.URL+"/inference", upstream.Client(), &idMint{}).ServeHTTP(w, request)
 	if w.Code != http.StatusOK {
 		t.Fatalf("client status = %d body %q", w.Code, w.Body.String())
+	}
+	if upstreamURI != "/inference/openai/v1/chat/completions" {
+		t.Fatalf("upstream request URI = %q, want mapped Chat route", upstreamURI)
 	}
 	mu.Lock()
 	if upstreamBody == nil {

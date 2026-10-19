@@ -286,19 +286,25 @@ func TestProxyHandlerInferenceNormalizationPreservesWireFormats(t *testing.T) {
 		name         string
 		upstreamPath string
 		path         string
+		wantURI      string
 		body         string
 		wantNested   bool
 		wantNames    []string
 		wantChoice   any
 	}{
-		{name: "inference OpenAI Chat", upstreamPath: "/inference/openai", path: "/v1/chat/completions", body: `{"model":"gpt-4o","messages":[],"tool_choice":"required","tools":[{"type":"function","function":{"name":"bash","parameters":{"type":"string"}}},{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`, wantNested: true, wantNames: []string{"bash", "lookup", "glob", "grep", "read"}, wantChoice: "required"},
-		{name: "inference Anthropic Responses", upstreamPath: "/inference/anthropic", path: "/v1/responses", body: `{"model":"muse-spark-1.3","input":"hi","tools":[{"type":"function","name":"bash","parameters":{"type":"string"}},{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":"required"}`, wantNames: []string{"bash", "lookup", "glob", "grep", "read"}, wantChoice: "required"},
-		{name: "inference Google Chat", upstreamPath: "/inference/google", path: "/v1/chat/completions", body: `{"model":"gpt-4o","messages":[],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`, wantNested: true, wantNames: []string{"lookup", "bash", "glob", "grep", "read"}},
-		{name: "legacy upstream keeps client tools", upstreamPath: "/zen/v1", path: "/zen/v1/chat/completions", body: `{"model":"gpt-4o","messages":[],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`, wantNested: true, wantNames: []string{"lookup"}},
+		{name: "inference OpenAI Chat", upstreamPath: "/inference", path: "/v1/chat/completions?trace=chat%2F1", wantURI: "/inference/openai/v1/chat/completions?trace=chat%2F1", body: `{"model":"gpt-4o","messages":[],"tool_choice":"required","tools":[{"type":"function","function":{"name":"bash","parameters":{"type":"string"}}},{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`, wantNested: true, wantNames: []string{"bash", "lookup", "glob", "grep", "read"}, wantChoice: "required"},
+		{name: "inference Muse Chat", upstreamPath: "/inference", path: "/v1/chat/completions?trace=muse%2Fchat", wantURI: "/inference/openai/v1/responses?trace=muse%2Fchat", body: `{"model":"muse-spark-1.3","messages":[{"role":"user","content":"hi"}],"tool_choice":"required","tools":[{"type":"function","function":{"name":"bash","parameters":{"type":"string"}}}]}`, wantNames: []string{"bash", "glob", "grep", "read"}, wantChoice: "required"},
+		{name: "inference Muse Responses", upstreamPath: "/inference", path: "/v1/responses?trace=muse%2Fresponses", wantURI: "/inference/openai/v1/responses?trace=muse%2Fresponses", body: `{"model":"muse-spark-1.3","input":"hi","tools":[{"type":"function","name":"bash","parameters":{"type":"string"}},{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":"required"}`, wantNames: []string{"bash", "lookup", "glob", "grep", "read"}, wantChoice: "required"},
+		{name: "exact inference OpenAI family", upstreamPath: "/inference/openai", path: "/v1/chat/completions?trace=exact%2Ffamily", wantURI: "/inference/openai/v1/chat/completions?trace=exact%2Ffamily", body: `{"model":"gpt-4o","messages":[],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`, wantNested: true, wantNames: []string{"lookup", "bash", "glob", "grep", "read"}},
+		{name: "inference Anthropic Responses", upstreamPath: "/inference/anthropic", path: "/v1/responses", wantURI: "/inference/anthropic/v1/responses", body: `{"model":"muse-spark-1.3","input":"hi","tools":[{"type":"function","name":"bash","parameters":{"type":"string"}},{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":"required"}`, wantNames: []string{"bash", "lookup", "glob", "grep", "read"}, wantChoice: "required"},
+		{name: "inference Google Chat", upstreamPath: "/inference/google", path: "/v1/chat/completions", wantURI: "/inference/google/v1/chat/completions", body: `{"model":"gpt-4o","messages":[],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`, wantNested: true, wantNames: []string{"lookup", "bash", "glob", "grep", "read"}},
+		{name: "unrelated legacy path keeps client tools", upstreamPath: "/zen/v1", path: "/chat/completions", wantURI: "/zen/v1/chat/completions", body: `{"model":"gpt-4o","messages":[],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`, wantNested: true, wantNames: []string{"lookup"}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			var upstreamURI string
 			var upstreamBody map[string]any
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamURI = r.URL.RequestURI()
 				payload, err := io.ReadAll(r.Body)
 				if err != nil {
 					t.Error(err)
@@ -320,6 +326,9 @@ func TestProxyHandlerInferenceNormalizationPreservesWireFormats(t *testing.T) {
 			proxyHandler(upstream.URL+tt.upstreamPath, upstream.Client(), &idMint{}).ServeHTTP(w, request)
 			if w.Code != http.StatusOK {
 				t.Fatalf("proxy response = %d %q", w.Code, w.Body.String())
+			}
+			if upstreamURI != tt.wantURI {
+				t.Fatalf("upstream request URI = %q, want %q", upstreamURI, tt.wantURI)
 			}
 			tools := array(t, upstreamBody["tools"])
 			if len(tools) != len(tt.wantNames) {

@@ -75,7 +75,7 @@ func TestRelayForwardsFinalRequestAndSSE(t *testing.T) {
 	if gotTarget != relayTarget {
 		t.Fatalf("relay target = %q, want %q", gotTarget, relayTarget)
 	}
-	if gotRelayPath != "/inference/v1/chat/completions?trace=a%2Fb" {
+	if gotRelayPath != "/inference/openai/v1/chat/completions?trace=a%2Fb" {
 		t.Fatalf("relay path = %q", gotRelayPath)
 	}
 	if gotAuth != "Bearer relay-test-key" || gotRequestID == "" || gotRequestID == "spoofed-id" {
