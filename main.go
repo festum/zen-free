@@ -122,6 +122,24 @@ func inferencePath(upstream string) bool {
 	return false
 }
 
+func openAIInferenceRequestURI(upstream, requestURI string) string {
+	parsed, err := url.Parse(upstream)
+	if err != nil || strings.TrimRight(parsed.Path, "/") != "/inference" {
+		return requestURI
+	}
+
+	path, query, hasQuery := strings.Cut(requestURI, "?")
+	if path != "/v1/chat/completions" && path != "/v1/responses" {
+		return requestURI
+	}
+
+	path = "/openai" + path
+	if hasQuery {
+		return path + "?" + query
+	}
+	return path
+}
+
 func capturedTool(name string, nested bool) map[string]any {
 	for _, raw := range capturedOpenCodeTools {
 		tool := raw.(map[string]any)
@@ -425,7 +443,8 @@ func proxyHandlerWithRelay(upstream string, client *http.Client, mint *idMint, r
 				requestURI += "?" + r.URL.RawQuery
 			}
 		}
-		target := base + requestURI
+
+		target := base + openAIInferenceRequestURI(upstream, requestURI)
 		var bodyBytes []byte
 		if hasBody(r) {
 			bodyBytes, err = io.ReadAll(r.Body)
@@ -535,10 +554,11 @@ func proxyHandlerWithRelay(upstream string, client *http.Client, mint *idMint, r
 					responsesWire = true
 					bodyBytes = nativeResponses
 					contentLength = int64(len(nativeResponses))
-					target = base + "/v1/responses"
+					nativeRequestURI := "/v1/responses"
 					if r.URL.RawQuery != "" {
-						target += "?" + r.URL.RawQuery
+						nativeRequestURI += "?" + r.URL.RawQuery
 					}
+					target = base + openAIInferenceRequestURI(upstream, nativeRequestURI)
 					retryLog(attempt, "protocol_fallback", session)
 					continue
 				}
