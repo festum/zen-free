@@ -6,7 +6,7 @@ OpenAI-compatible client can point at it to reach the `-free` catalog. The
 upstream sees the desktop user agent, a minted `ses_`/`msg_` id pair, the
 `x-opencode-*` headers (including a process-stable project ID and session affinity),
 and the six captured OpenCode `bash`, `edit`, `glob`, `grep`, `read`, and `write`
-tools when the caller supplies no tools. Caller tool lists are preserved unchanged.
+tools when the caller supplies no tools. Caller-declared tool calls remain visible.
 
 ## Config
 
@@ -18,6 +18,8 @@ tools when the caller supplies no tools. Caller tool lists are preserved unchang
 - `OPENCODE_GO_API_KEY`: when set, forwarded upstream as `Authorization: Bearer <key>`.
 - `ZEN_RETRY_BUDGET`: retry-loop budget in seconds (default `300`); exhausted, the
   proxy answers `502 upstream_interrupted`.
+- `ZEN_DEBUG_DUMP`: any non-empty value enables temporary upstream 4xx diagnostics with structural request summaries and capture metadata, without raw bodies. Each handler captures at most 16 records, with a two-second error-body pre-read deadline and a 64 KiB error-body capture limit. Metadata may still contain sensitive identifiers; headers are never included.
+- `ZEN_DEBUG_DUMP_RAW`: exactly `1` adds raw bodies only when `ZEN_DEBUG_DUMP` is enabled. Raw client and upstream request bodies are capped at 1 MiB each; raw error bodies are capped at 64 KiB. Raw bodies may contain sensitive user data. Enable diagnostics only for a short investigation and remove both variables afterward.
 - Module `github.com/festum/zen-free`, no third-party dependencies; build with
   `go build .` or the included Dockerfile.
 
@@ -34,8 +36,9 @@ gate-required `bash`, `glob`, `grep`, and `read` tools. Empty tool lists retain
 the existing six-tool injection behavior. Outside `/inference`, tool handling
 retains its existing behavior. For Chat Completions, the proxy defaults
 `tool_choice` to `"none"` only when the caller did not supply tools or a choice;
-Responses requests leave the choice unpinned. Calls to proxy-managed core tools
-are removed from responses, while calls to arbitrary caller tools remain available.
+Responses requests leave the choice unpinned. Only calls to tools appended by the
+proxy are removed from responses. Caller-declared calls remain visible even when
+their schemas are normalized.
 
 ## Run
 
@@ -87,4 +90,11 @@ Reach it as `http://oc-zen-go:8801/v1`.
 - `POST /v1/responses` on any other model is converted to the chat wire and the
   reply converted back, retrying once on the native Responses route when the
   upstream answers `400 ModelProtocolUnsupported`.
+- Chat-backed Responses preserve upstream reasoning as the first `reasoning` item
+  with `content[].reasoning_text`, followed by the assistant message when present,
+  then function calls. Streaming reasoning remains live; text and tool events wait
+  for the upstream terminal condition so reasoning delta/done events finish before
+  output text, including when reasoning arrives after content. Replay the complete
+  `output` array in subsequent `input` history to restore assistant
+  `reasoning_content`; summary-only history uses `summary[].summary_text` as a fallback.
 - `jev-*` needs the systemone wire and is rejected with `400`.

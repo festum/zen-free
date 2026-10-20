@@ -184,13 +184,85 @@ func TestNormalizeCapturedCoreToolsPreservesCallerTools(t *testing.T) {
 					}
 				}
 			}
-			for _, core := range []string{"bash", "glob", "grep", "read", "write"} {
+			for _, core := range []string{"glob", "grep", "read"} {
 				if !filter[core] {
-					t.Errorf("filter does not hide normalized core tool %q", core)
+					t.Errorf("filter does not hide appended tool %q", core)
 				}
 			}
-			if filter["lookup"] {
-				t.Error("filter hides arbitrary caller tool lookup")
+			for _, caller := range []string{"bash", "write", "lookup"} {
+				if filter[caller] {
+					t.Errorf("filter hides caller tool %q", caller)
+				}
+			}
+			cases := []struct {
+				name      string
+				callers   []string
+				normalize bool
+			}{
+				{name: "absent", normalize: true},
+				{name: "empty", callers: []string{}, normalize: true},
+				{name: "complete required", callers: []string{"bash", "glob", "grep", "read"}, normalize: true},
+				{name: "outside inference", callers: []string{"bash", "lookup"}},
+			}
+			for _, raw := range capturedOpenCodeTools {
+				core := toolName(object(t, raw))
+				cases = append(cases, struct {
+					name      string
+					callers   []string
+					normalize bool
+				}{name: "caller " + core, callers: []string{core}, normalize: true})
+			}
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					body := map[string]any{}
+					callerTools := make([]any, 0, len(tc.callers))
+					for _, caller := range tc.callers {
+						function := map[string]any{"name": caller, "parameters": map[string]any{"type": "string"}}
+						tool := map[string]any{"type": "function", "function": function}
+						if !nested {
+							tool = map[string]any{"type": "function", "name": caller, "parameters": function["parameters"]}
+						}
+						callerTools = append(callerTools, tool)
+					}
+					if tc.callers != nil {
+						body["tools"] = callerTools
+					}
+					before, _ := json.Marshal(body)
+					filter := augmentTools(body, nested, tc.normalize)
+					if !tc.normalize {
+						after, _ := json.Marshal(body)
+						if string(after) != string(before) || len(filter) != 0 {
+							t.Fatalf("non-inference tools changed: body=%s filter=%v", after, filter)
+						}
+						return
+					}
+					got := array(t, body["tools"])
+					wantNames := append([]string{}, tc.callers...)
+					if len(tc.callers) == 0 {
+						wantNames = []string{"bash", "edit", "glob", "grep", "read", "write"}
+					} else {
+						for _, required := range []string{"bash", "glob", "grep", "read"} {
+							present := false
+							for _, caller := range tc.callers {
+								present = present || caller == required
+							}
+							if !present {
+								wantNames = append(wantNames, required)
+							}
+						}
+					}
+					if len(got) != len(wantNames) || len(filter) != len(wantNames)-len(tc.callers) {
+						t.Fatalf("tools=%#v filter=%v, want names=%v and %d hidden", got, filter, wantNames, len(wantNames)-len(tc.callers))
+					}
+					for i, wantName := range wantNames {
+						tool := object(t, got[i])
+						want, _ := json.Marshal(capturedTool(wantName, nested))
+						actual, _ := json.Marshal(tool)
+						if toolName(tool) != wantName || string(actual) != string(want) || filter[wantName] != (i >= len(tc.callers)) {
+							t.Errorf("tool[%d]=%s hidden=%t, want %s hidden=%t", i, actual, filter[wantName], want, i >= len(tc.callers))
+						}
+					}
+				})
 			}
 		})
 	}

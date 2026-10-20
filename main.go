@@ -200,7 +200,6 @@ func augmentTools(body map[string]any, nested, normalize bool) map[string]bool {
 			continue
 		}
 		tools[i] = capturedTool(name, nested)
-		filter[name] = true
 		seenRequired[name] = true
 	}
 	for _, name := range []string{"bash", "glob", "grep", "read"} {
@@ -293,6 +292,55 @@ func (f flushWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+func isReasoningRequiredError(b []byte) bool {
+	return bytes.Contains(b, []byte("reasoning_content")) && bytes.Contains(b, []byte("thinking mode"))
+}
+
+func repairReasoningContent(body []byte) ([]byte, bool) {
+	var request map[string]json.RawMessage
+	if json.Unmarshal(body, &request) != nil || request == nil {
+		return nil, false
+	}
+	var messages []json.RawMessage
+	if json.Unmarshal(request["messages"], &messages) != nil {
+		return nil, false
+	}
+	changed := false
+	for i, raw := range messages {
+		var message map[string]json.RawMessage
+		if json.Unmarshal(raw, &message) != nil || message == nil {
+			continue
+		}
+		var role string
+		if json.Unmarshal(message["role"], &role) != nil || role != "assistant" {
+			continue
+		}
+		if _, exists := message["reasoning_content"]; exists {
+			continue
+		}
+		message["reasoning_content"] = json.RawMessage(`""`)
+		updated, err := json.Marshal(message)
+		if err != nil {
+			return nil, false
+		}
+		messages[i] = updated
+		changed = true
+	}
+	if !changed {
+		return nil, false
+	}
+	updated, err := json.Marshal(messages)
+	if err != nil {
+		return nil, false
+	}
+	request["messages"] = updated
+	repaired, err := json.Marshal(request)
+	if err != nil {
+		return nil, false
+	}
+	return repaired, true
+}
+
 func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handler {
 	return proxyHandlerWithRelay(upstream, client, mint, parseRelayURL(os.Getenv("ZEN_RELAY_URL")))
 }
@@ -309,6 +357,8 @@ func proxyHandlerWithRelay(upstream string, client *http.Client, mint *idMint, r
 	}
 	apiKey := os.Getenv("OPENCODE_GO_API_KEY")
 	inference := inferencePath(upstream)
+	debugDumps := debugDumpAllowance{enabled: os.Getenv("ZEN_DEBUG_DUMP") != ""}
+	debugRaw := os.Getenv("ZEN_DEBUG_DUMP_RAW") == "1"
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if relay.err != nil {
 			http.Error(w, relay.err.Error(), http.StatusInternalServerError)
@@ -357,7 +407,7 @@ func proxyHandlerWithRelay(upstream string, client *http.Client, mint *idMint, r
 				injectedTools = augmentFlatTools(requestBody, inference)
 				toolFilter = requestToolFilter(injectedTools)
 				nativeResponsesBody := original
-				if forcedStream || len(injectedTools) > 0 {
+				if forcedStream || inference || len(injectedTools) > 0 {
 					updated, marshalErr := json.Marshal(requestBody)
 					if marshalErr != nil {
 						http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -418,7 +468,7 @@ func proxyHandlerWithRelay(upstream string, client *http.Client, mint *idMint, r
 					chatWire = true
 					requestBody["stream"] = true
 				}
-				if len(injectedTools) > 0 || chatWire {
+				if len(injectedTools) > 0 || chatWire || inference {
 					updated, marshalErr := json.Marshal(requestBody)
 					if marshalErr != nil {
 						http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -454,6 +504,9 @@ func proxyHandlerWithRelay(upstream string, client *http.Client, mint *idMint, r
 			}
 			_ = r.Body.Close()
 		}
+		if !decoded {
+			original = bodyBytes
+		}
 		contentLength := r.ContentLength
 		headers := r.Header.Clone()
 		stripHopHeaders(headers)
@@ -482,6 +535,7 @@ func proxyHandlerWithRelay(upstream string, client *http.Client, mint *idMint, r
 		defer cancel()
 		replay := &responseReplayState{}
 		var finalErr error
+		reasoningRepaired := false
 		attemptLimit := maxAttempts
 		if relay.enabled() {
 			attemptLimit = 1
@@ -519,7 +573,23 @@ func proxyHandlerWithRelay(upstream string, client *http.Client, mint *idMint, r
 				out.Header.Set("x-relay-path", relayPath)
 			}
 			resp, doErr := egressClient.Do(out)
-			stopAttempt()
+			if doErr != nil || !debugDumps.acquire(resp.StatusCode) {
+				stopAttempt()
+			} else {
+				upstreamURL, _ := url.Parse(target)
+				captureUpstream4xx(loopCtx, cancelAttempt, resp, original, bodyBytes, map[string]any{
+					"request_id":    requestID,
+					"session":       session,
+					"attempt":       attempt,
+					"client_path":   r.URL.Path,
+					"upstream_path": upstreamURL.Path,
+					"model":         requestedModel,
+					"relay":         relay.enabled(),
+					"status":        resp.StatusCode,
+				}, debugRaw)
+				stopAttempt()
+				debugDumps.finish()
+			}
 			if doErr != nil {
 				cancelAttempt()
 				finalErr = doErr
@@ -543,9 +613,29 @@ func proxyHandlerWithRelay(upstream string, client *http.Client, mint *idMint, r
 				}
 				break
 			}
+			var errBytes []byte
+			var errorReadErr error
+			if resp.StatusCode == http.StatusBadRequest {
+				errBytes, errorReadErr = io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+				if errorReadErr == nil && !reasoningRepaired && isReasoningRequiredError(errBytes) {
+					if repaired, changed := repairReasoningContent(bodyBytes); changed {
+						bodyBytes = repaired
+						contentLength = int64(len(bodyBytes))
+						reasoningRepaired = true
+						attemptLimit++
+						_ = resp.Body.Close()
+						cancelAttempt()
+						continue
+					}
+				}
+				resp.Body = struct {
+					io.Reader
+					io.Closer
+				}{io.MultiReader(bytes.NewReader(errBytes), resp.Body), resp.Body}
+			}
 			stripHopHeaders(resp.Header)
 			if responsesToChat && !nativeFallback && resp.StatusCode == http.StatusBadRequest {
-				fallbackBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+				fallbackBody, readErr := errBytes, errorReadErr
 				_ = resp.Body.Close()
 				cancelAttempt()
 				if !relay.enabled() && readErr == nil && bytes.Contains(fallbackBody, []byte("ModelProtocolUnsupported")) {

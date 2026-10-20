@@ -860,79 +860,279 @@ func TestProxyHandlerInjectedToolCallsAreFiltered(t *testing.T) {
 		}
 	})
 
-	t.Run("normalized core call is filtered", func(t *testing.T) {
-		setStabilityTestKnobs(t)
-		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "text/event-stream")
-			_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"core\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}},{\"index\":1,\"id\":\"custom\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}\n\n")
-			_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n")
-			_, _ = io.WriteString(w, "data: [DONE]\n\n")
-		}))
-		defer upstream.Close()
-		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4o","stream":false,"messages":[],"tools":[{"type":"function","function":{"name":"bash","parameters":{"type":"object"}}},{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`))
-		request.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
-		proxyHandler(upstream.URL+"/inference/openai", upstream.Client(), &idMint{}).ServeHTTP(w, request)
-		completion := decodeJSON(t, w.Body.Bytes())
-		choice := object(t, array(t, completion["choices"])[0])
-		calls := array(t, object(t, choice["message"])["tool_calls"])
-		if len(calls) != 1 {
-			t.Fatalf("tool calls after normalized-core filtering = %#v, want only lookup", calls)
-		}
-		if name := stringValue(object(t, object(t, calls[0])["function"])["name"]); name != "lookup" {
-			t.Fatalf("remaining tool call = %q, want lookup", name)
+	t.Run("normalized caller calls remain", func(t *testing.T) {
+		for _, muse := range []bool{false, true} {
+			for _, streaming := range []bool{false, true} {
+				model := "gpt-4o"
+				if muse {
+					model = "muse-spark-1.3"
+				}
+				t.Run(model+"/stream="+strconv.FormatBool(streaming), func(t *testing.T) {
+					assertNormalizedCallerHTTP(t, false, muse, streaming)
+				})
+			}
 		}
 	})
 }
 
-func TestProxyHandlerFiltersNormalizedResponsesCoreCalls(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_norm\",\"created_at\":123,\"output\":[]}}\n\n")
-		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_norm\",\"created_at\":123,\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"id\":\"core\",\"call_id\":\"core\",\"name\":\"bash\",\"arguments\":\"{}\"},{\"type\":\"function_call\",\"id\":\"custom\",\"call_id\":\"custom\",\"name\":\"lookup\",\"arguments\":\"{}\"},{\"type\":\"message\",\"id\":\"msg\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}]}}\n\n")
-		_, _ = io.WriteString(w, "data: [DONE]\n\n")
-	}))
-	defer upstream.Close()
-	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"muse-spark-1.3","input":"run","stream":true,"tools":[{"type":"function","name":"bash","parameters":{"type":"string"}},{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`))
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Accept", "text/event-stream")
-	w := httptest.NewRecorder()
-	proxyHandler(upstream.URL+"/inference/anthropic", upstream.Client(), &idMint{}).ServeHTTP(w, request)
-	if w.Code != http.StatusOK {
-		t.Fatalf("proxy response = %d %q", w.Code, w.Body.String())
-	}
-	if strings.Contains(w.Body.String(), `"name":"bash"`) {
-		t.Fatalf("normalized Responses core call leaked: %q", w.Body.String())
-	}
-	if !strings.Contains(w.Body.String(), `"name":"lookup"`) {
-		t.Fatalf("arbitrary Responses call was removed: %q", w.Body.String())
+func TestProxyHandlerPreservesNormalizedResponsesCoreCalls(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		t.Run("stream="+strconv.FormatBool(streaming), func(t *testing.T) {
+			assertNormalizedCallerHTTP(t, true, true, streaming)
+		})
 	}
 }
 
-func TestProxyHandlerFiltersNormalizedResponsesFallbackCalls(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasSuffix(r.URL.Path, "/v1/chat/completions") {
-			t.Errorf("upstream path = %q, want suffix /v1/chat/completions", r.URL.Path)
+func TestProxyHandlerPreservesNormalizedChatBackedResponsesCoreCalls(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		t.Run("stream="+strconv.FormatBool(streaming), func(t *testing.T) {
+			assertNormalizedCallerHTTP(t, true, false, streaming)
+		})
+	}
+}
+
+func normalizedCallerSSE(t *testing.T, responsesWire bool) string {
+	t.Helper()
+	var fixture strings.Builder
+	emit := func(payload map[string]any) {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
 		}
+		fixture.WriteString("data: " + string(encoded) + "\n\n")
+	}
+	if responsesWire {
+		emit(map[string]any{"type": "response.created", "response": map[string]any{"id": "resp_visibility", "object": "response", "created_at": 123, "status": "in_progress", "output": []any{}}})
+	}
+	var output []any
+	for i, call := range []struct{ id, name, arguments string }{
+		{"caller-bash", "bash", `{"command":"printf 'caller-visible\\n'"}`},
+		{"proxy-read", "read", `{"filePath":"/tmp/proxy-only"}`},
+		{"caller-lookup", "lookup", `{"q":"127*43"}`},
+	} {
+		itemID := "item-" + call.id
+		item := map[string]any{"type": "function_call", "id": itemID, "call_id": call.id, "name": call.name, "arguments": "", "status": "in_progress"}
+		if responsesWire {
+			emit(map[string]any{"type": "response.output_item.added", "output_index": i, "item": cloneToolValue(item)})
+		} else {
+			emit(map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []any{map[string]any{"index": i, "id": call.id, "type": "function", "function": map[string]any{"name": call.name, "arguments": ""}}}}}}})
+		}
+		for _, fragment := range []string{call.arguments[:len(call.arguments)/2], call.arguments[len(call.arguments)/2:]} {
+			if responsesWire {
+				emit(map[string]any{"type": "response.function_call_arguments.delta", "output_index": i, "item_id": itemID, "delta": fragment})
+			} else {
+				emit(map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []any{map[string]any{"index": i, "function": map[string]any{"arguments": fragment}}}}}}})
+			}
+		}
+		item["arguments"], item["status"] = call.arguments, "completed"
+		output = append(output, item)
+		if responsesWire {
+			emit(map[string]any{"type": "response.function_call_arguments.done", "output_index": i, "item_id": itemID, "arguments": call.arguments})
+			emit(map[string]any{"type": "response.output_item.done", "output_index": i, "item": item})
+		}
+	}
+	if responsesWire {
+		emit(map[string]any{"type": "response.completed", "response": map[string]any{"id": "resp_visibility", "object": "response", "created_at": 123, "status": "completed", "output": output}})
+	} else {
+		emit(map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "tool_calls"}}})
+	}
+	fixture.WriteString("data: [DONE]\n\n")
+	return fixture.String()
+}
+
+func assertNormalizedCallerHTTP(t *testing.T, responsesWire, muse, streaming bool) {
+	t.Helper()
+	setStabilityTestKnobs(t)
+	t.Setenv("ZEN_RELAY_URL", "")
+	t.Setenv("OPENCODE_GO_API_KEY", "")
+	fixture := normalizedCallerSSE(t, muse)
+	var upstreamPath string
+	var upstreamBody map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamPath = r.URL.Path
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+		upstreamBody = decodeJSON(t, body)
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"core\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}},{\"index\":1,\"id\":\"custom\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}\n\n")
-		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n")
-		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		_, _ = io.WriteString(w, fixture)
 	}))
 	defer upstream.Close()
-	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-4o","input":"run","stream":true,"tools":[{"type":"function","name":"bash","parameters":{"type":"string"}},{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`))
+	path, model := "/v1/chat/completions", "gpt-4o"
+	if muse {
+		model = "muse-spark-1.3"
+	}
+	body := map[string]any{"model": model, "stream": streaming, "messages": []any{}, "tools": []any{
+		map[string]any{"type": "function", "function": map[string]any{"name": "bash", "parameters": map[string]any{"type": "string"}}},
+		map[string]any{"type": "function", "function": map[string]any{"name": "lookup", "parameters": map[string]any{"type": "object"}}},
+	}}
+	if responsesWire {
+		path = "/v1/responses"
+		body["input"] = "run"
+		delete(body, "messages")
+		body["tools"] = []any{map[string]any{"type": "function", "name": "bash", "parameters": map[string]any{"type": "string"}}, map[string]any{"type": "function", "name": "lookup", "parameters": map[string]any{"type": "object"}}}
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(encoded))
 	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Accept", "text/event-stream")
+	if streaming {
+		request.Header.Set("Accept", "text/event-stream")
+	}
 	w := httptest.NewRecorder()
 	proxyHandler(upstream.URL+"/inference/openai", upstream.Client(), &idMint{}).ServeHTTP(w, request)
+	wantPath := "/inference/openai/v1/chat/completions"
+	if muse {
+		wantPath = "/inference/openai/v1/responses"
+	}
+	if upstreamPath != wantPath || upstreamBody["stream"] != true {
+		t.Fatalf("upstream path=%q body=%#v", upstreamPath, upstreamBody)
+	}
+	if muse {
+		assertHasFlatToolNames(t, upstreamBody["tools"], "bash", "lookup", "read")
+	} else {
+		assertHasNestedToolNames(t, upstreamBody["tools"], "bash", "lookup", "read")
+	}
+	t.Logf("local fixture upstream path=%s SSE=%s", upstreamPath, fixture)
+	t.Logf("local fixture client stream=%t status=%d body=%s", streaming, w.Code, w.Body.String())
 	if w.Code != http.StatusOK {
 		t.Fatalf("proxy response = %d %q", w.Code, w.Body.String())
 	}
-	if strings.Contains(w.Body.String(), `"name":"bash"`) {
-		t.Fatalf("normalized Responses fallback core call leaked: %q", w.Body.String())
+	assertNormalizedCallerOutput(t, w.Body.String(), responsesWire, streaming)
+}
+
+func assertNormalizedCallerOutput(t *testing.T, body string, responsesWire, streaming bool) {
+	t.Helper()
+	for _, hidden := range []string{"proxy-read", "proxy-only", "filePath", `"name":"read"`} {
+		if strings.Contains(body, hidden) {
+			t.Errorf("proxy-only call leaked %q: %s", hidden, body)
+		}
 	}
-	if !strings.Contains(w.Body.String(), `"name":"lookup"`) {
-		t.Fatalf("arbitrary Responses fallback call was removed: %q", w.Body.String())
+	var payloads []map[string]any
+	if streaming {
+		payloads = ssePayloads(t, body)
+		if !strings.HasSuffix(body, "data: [DONE]\n\n") {
+			t.Fatalf("client stream lacks terminal marker: %s", body)
+		}
+	} else {
+		payloads = []map[string]any{decodeJSON(t, []byte(body))}
+	}
+	wantIDs := []string{"caller-bash", "caller-lookup"}
+	wantNames := []string{"bash", "lookup"}
+	wantArguments := []string{`{"command":"printf 'caller-visible\\n'"}`, `{"q":"127*43"}`}
+	var calls []any
+	if responsesWire {
+		last := payloads[len(payloads)-1]
+		response := last
+		if streaming {
+			if last["type"] != "response.completed" {
+				t.Fatalf("terminal event=%#v, want response.completed", last)
+			}
+			response = object(t, last["response"])
+			var addedIDs []string
+			var doneIDs []string
+			itemCalls := map[string]string{}
+			arguments := map[string]string{}
+			for _, payload := range payloads {
+				switch payload["type"] {
+				case "response.output_item.added":
+					item := object(t, payload["item"])
+					if item["type"] == "function_call" {
+						id := stringValue(item["call_id"])
+						addedIDs = append(addedIDs, id)
+						itemCalls[stringValue(item["id"])] = id
+					}
+				case "response.function_call_arguments.delta":
+					id, ok := itemCalls[stringValue(payload["item_id"])]
+					if !ok {
+						t.Fatalf("arguments event without visible added item: %#v", payload)
+					}
+					arguments[id] += stringValue(payload["delta"])
+				case "response.function_call_arguments.done":
+					id := itemCalls[stringValue(payload["item_id"])]
+					if id == "" || arguments[id] != stringValue(payload["arguments"]) {
+						t.Errorf("arguments done differs from deltas: %#v, assembled=%q", payload, arguments[id])
+					}
+				case "response.output_item.done":
+					item := object(t, payload["item"])
+					if item["type"] == "function_call" {
+						id := stringValue(item["call_id"])
+						doneIDs = append(doneIDs, id)
+						if itemCalls[stringValue(item["id"])] != id || arguments[id] != stringValue(item["arguments"]) {
+							t.Errorf("done item differs from visible added item/deltas: %#v", item)
+						}
+					}
+				}
+			}
+			if !reflect.DeepEqual(addedIDs, wantIDs) {
+				t.Errorf("visible added call order=%v, want %v", addedIDs, wantIDs)
+			}
+			if !reflect.DeepEqual(doneIDs, wantIDs) {
+				t.Errorf("visible done call order=%v, want %v", doneIDs, wantIDs)
+			}
+			for i, id := range wantIDs {
+				if arguments[id] != wantArguments[i] {
+					t.Errorf("streamed %s arguments=%q, want %q", id, arguments[id], wantArguments[i])
+				}
+			}
+		}
+		if response["status"] != "completed" {
+			t.Errorf("response status=%#v, want completed", response["status"])
+		}
+		calls = array(t, response["output"])
+	} else {
+		if streaming {
+			indices := map[any]int{}
+			for _, payload := range payloads {
+				choice := object(t, array(t, payload["choices"])[0])
+				delta := object(t, choice["delta"])
+				fragments, _ := delta["tool_calls"].([]any)
+				for _, raw := range fragments {
+					fragment := object(t, raw)
+					index := fragment["index"]
+					position, exists := indices[index]
+					if !exists {
+						position = len(calls)
+						indices[index] = position
+						calls = append(calls, map[string]any{"id": "", "function": map[string]any{"name": "", "arguments": ""}})
+					}
+					call := object(t, calls[position])
+					function := object(t, call["function"])
+					part := object(t, fragment["function"])
+					if id := stringValue(fragment["id"]); id != "" {
+						if call["id"] != "" && call["id"] != id {
+							t.Fatalf("call index %v changed ID from %v to %s", index, call["id"], id)
+						}
+						call["id"] = id
+					}
+					function["name"] = stringValue(function["name"]) + stringValue(part["name"])
+					function["arguments"] = stringValue(function["arguments"]) + stringValue(part["arguments"])
+				}
+			}
+		} else {
+			choice := object(t, array(t, payloads[0]["choices"])[0])
+			calls = array(t, object(t, choice["message"])["tool_calls"])
+		}
+		lastChoice := object(t, array(t, payloads[len(payloads)-1]["choices"])[0])
+		if lastChoice["finish_reason"] != "tool_calls" {
+			t.Errorf("finish_reason=%#v, want tool_calls", lastChoice["finish_reason"])
+		}
+	}
+	if len(calls) != len(wantIDs) {
+		t.Fatalf("visible calls=%#v, want bash then lookup", calls)
+	}
+	for i, raw := range calls {
+		call := object(t, raw)
+		id, function := call["call_id"], call
+		if !responsesWire {
+			id, function = call["id"], object(t, call["function"])
+		}
+		if id != wantIDs[i] || function["name"] != wantNames[i] || function["arguments"] != wantArguments[i] {
+			t.Errorf("call[%d]=%#v, want id=%s name=%s arguments=%s", i, call, wantIDs[i], wantNames[i], wantArguments[i])
+		}
 	}
 }
 func TestFilterToolCallsInJSON(t *testing.T) {

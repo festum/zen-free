@@ -47,6 +47,22 @@ func buildChatCompletionsRequest(responses map[string]any) map[string]any {
 		}
 		return last
 	}
+	var pendingReasoning strings.Builder
+	transferReasoning := func(assistant map[string]any) {
+		if pendingReasoning.Len() == 0 {
+			return
+		}
+		assistant["reasoning_content"] = stringValue(assistant["reasoning_content"]) + pendingReasoning.String()
+		pendingReasoning.Reset()
+	}
+	flushReasoning := func() {
+		if pendingReasoning.Len() == 0 {
+			return
+		}
+		assistant := map[string]any{"role": "assistant", "content": ""}
+		transferReasoning(assistant)
+		messages = append(messages, assistant)
+	}
 
 	switch input := responses["input"].(type) {
 	case string:
@@ -67,13 +83,31 @@ func buildChatCompletionsRequest(responses map[string]any) map[string]any {
 				if parts, isParts := content.([]any); isParts && len(parts) == 0 {
 					continue
 				}
-				messages = append(messages, map[string]any{"role": role, "content": content})
+				if role != "assistant" {
+					flushReasoning()
+				}
+				message := map[string]any{"role": role, "content": content}
+				messages = append(messages, message)
+				if role == "assistant" {
+					transferReasoning(message)
+				}
+			case "reasoning":
+				text := responsesReasoningText(item)
+				if text == "" {
+					continue
+				}
+				if assistant := lastAssistant(); assistant != nil {
+					assistant["reasoning_content"] = stringValue(assistant["reasoning_content"]) + text
+				} else {
+					pendingReasoning.WriteString(text)
+				}
 			case "function_call":
 				assistant := lastAssistant()
 				if assistant == nil {
 					assistant = map[string]any{"role": "assistant", "content": ""}
 					messages = append(messages, assistant)
 				}
+				transferReasoning(assistant)
 				arguments, ok := item["arguments"].(string)
 				if !ok {
 					arguments = "{}"
@@ -86,10 +120,12 @@ func buildChatCompletionsRequest(responses map[string]any) map[string]any {
 				calls, _ := assistant["tool_calls"].([]any)
 				assistant["tool_calls"] = append(calls, call)
 			case "function_call_output":
+				flushReasoning()
 				messages = append(messages, map[string]any{"role": "tool", "tool_call_id": item["call_id"], "content": item["output"]})
 			}
 		}
 	}
+	flushReasoning()
 	chat["messages"] = messages
 
 	flatTools, _ := responses["tools"].([]any)
@@ -130,6 +166,30 @@ func buildChatCompletionsRequest(responses map[string]any) map[string]any {
 		chat["max_tokens"] = maxTokens
 	}
 	return chat
+}
+
+func responsesReasoningText(item map[string]any) string {
+	var text strings.Builder
+	content, _ := item["content"].([]any)
+	for _, rawPart := range content {
+		part, ok := rawPart.(map[string]any)
+		if !ok || part["type"] != "reasoning_text" {
+			continue
+		}
+		text.WriteString(stringValue(part["text"]))
+	}
+	if text.Len() != 0 {
+		return text.String()
+	}
+	summary, _ := item["summary"].([]any)
+	for _, rawPart := range summary {
+		part, ok := rawPart.(map[string]any)
+		if !ok || part["type"] != "summary_text" {
+			continue
+		}
+		text.WriteString(stringValue(part["text"]))
+	}
+	return text.String()
 }
 
 func chatContent(raw any) any {
@@ -234,6 +294,10 @@ type responsesStreamState struct {
 	msgIndex        int
 	msgOpen         bool
 	text            strings.Builder
+	reasoning       strings.Builder
+	reasoningID     string
+	reasoningIndex  int
+	reasoningOpen   bool
 	toolCalls       []*responseToolCall
 	toolItems       []map[string]any
 	toolIndex       map[int]int
@@ -241,6 +305,8 @@ type responsesStreamState struct {
 	hiddenTools     map[int]bool
 	pendingOrder    []int
 	pendingTools    map[int]*pendingResponseTool
+	pendingDeltas   []map[string]any
+	messagePending  bool
 	usage           map[string]any
 	finish          string
 	failure         string
@@ -279,6 +345,40 @@ func (s *responsesStreamState) ensureMessage() error {
 		return err
 	}
 	return s.writer.emit("response.content_part.added", map[string]any{"item_id": s.messageID, "output_index": s.msgIndex, "content_index": 0, "part": map[string]any{"type": "output_text", "text": ""}})
+}
+
+func (s *responsesStreamState) appendReasoning(delta string) error {
+	if delta == "" {
+		return nil
+	}
+	if !s.reasoningOpen {
+		s.reasoningOpen = true
+		s.reasoningID = mintItemID("rs_")
+		s.reasoningIndex = len(s.output)
+		part := map[string]any{"type": "reasoning_text", "text": ""}
+		item := map[string]any{
+			"type":    "reasoning",
+			"id":      s.reasoningID,
+			"status":  "in_progress",
+			"summary": []any{},
+			"content": []any{part},
+		}
+		s.output = append(s.output, item)
+		if err := s.writer.emit("response.output_item.added", map[string]any{
+			"item": item, "output_index": s.reasoningIndex,
+		}); err != nil {
+			return err
+		}
+		if err := s.writer.emit("response.content_part.added", map[string]any{
+			"item_id": s.reasoningID, "output_index": s.reasoningIndex, "content_index": 0, "part": part,
+		}); err != nil {
+			return err
+		}
+	}
+	s.reasoning.WriteString(delta)
+	return s.writer.emit("response.reasoning_text.delta", map[string]any{
+		"item_id": s.reasoningID, "output_index": s.reasoningIndex, "content_index": 0, "delta": delta,
+	})
 }
 
 func responseToolSlot(chunk map[string]any) int {
@@ -354,6 +454,32 @@ func (s *responsesStreamState) flushPendingTools(filter toolCallFilter, final bo
 			if err := s.writer.emit("response.function_call_arguments.delta", map[string]any{"item_id": pending.item["id"], "output_index": s.toolOutputIndex[s.toolIndex[slot]], "call_id": pending.call.ID, "name": name, "delta": delta}); err != nil {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+func (s *responsesStreamState) finishReasoning() error {
+	if s.reasoningOpen {
+		text := s.reasoning.String()
+		if err := s.writer.emit("response.reasoning_text.done", map[string]any{
+			"item_id": s.reasoningID, "output_index": s.reasoningIndex, "content_index": 0, "text": text,
+		}); err != nil {
+			return err
+		}
+		part := map[string]any{"type": "reasoning_text", "text": text}
+		if err := s.writer.emit("response.content_part.done", map[string]any{
+			"item_id": s.reasoningID, "output_index": s.reasoningIndex, "content_index": 0, "part": part,
+		}); err != nil {
+			return err
+		}
+		item := s.output[s.reasoningIndex].(map[string]any)
+		item["status"] = "completed"
+		item["content"] = []any{part}
+		if err := s.writer.emit("response.output_item.done", map[string]any{
+			"item": item, "output_index": s.reasoningIndex,
+		}); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -445,29 +571,19 @@ func writeChatStreamAsResponses(w http.ResponseWriter, body io.Reader, model str
 		if delta == nil {
 			delta = map[string]any{}
 		}
-		if content := stringValue(delta["content"]); content != "" {
-			if err := state.ensureMessage(); err != nil {
-				return err
-			}
-			state.text.WriteString(content)
-			if err := state.writer.emit("response.output_text.delta", map[string]any{"item_id": state.messageID, "output_index": state.msgIndex, "content_index": 0, "delta": content}); err != nil {
-				return err
-			}
-		} else if !state.msgOpen && stringValue(delta["role"]) == "assistant" {
-			if err := state.ensureMessage(); err != nil {
-				return err
-			}
+		content := stringValue(delta["content"])
+		if content != "" || stringValue(delta["role"]) == "assistant" {
+			state.messagePending = true
 		}
-		if calls, ok := delta["tool_calls"].([]any); ok {
-			for _, rawCall := range calls {
-				call, ok := rawCall.(map[string]any)
-				if ok {
-					state.appendToolChunk(call)
-				}
-			}
-			if err := state.flushPendingTools(filter, false); err != nil {
-				return err
-			}
+		_, hasCalls := delta["tool_calls"].([]any)
+		if content != "" || hasCalls {
+			state.pendingDeltas = append(state.pendingDeltas, delta)
+		}
+		if err := state.appendReasoning(stringValue(delta["reasoning_content"])); err != nil {
+			return err
+		}
+		if err := state.appendReasoning(stringValue(delta["reasoning"])); err != nil {
+			return err
 		}
 		if reason := stringValue(choice["finish_reason"]); reason != "" {
 			state.finish = reason
@@ -533,6 +649,32 @@ func writeChatStreamAsResponses(w http.ResponseWriter, body io.Reader, model str
 		}
 		return writeStreamInterrupted(w, true), false
 	}
+	if err := state.finishReasoning(); err != nil {
+		return http.StatusBadGateway, false
+	}
+	if state.messagePending {
+		if err := state.ensureMessage(); err != nil {
+			return writeStreamInterrupted(w, true), false
+		}
+	}
+	for _, delta := range state.pendingDeltas {
+		if content := stringValue(delta["content"]); content != "" {
+			state.text.WriteString(content)
+			if err := state.writer.emit("response.output_text.delta", map[string]any{"item_id": state.messageID, "output_index": state.msgIndex, "content_index": 0, "delta": content}); err != nil {
+				return writeStreamInterrupted(w, true), false
+			}
+		}
+		if calls, ok := delta["tool_calls"].([]any); ok {
+			for _, rawCall := range calls {
+				if call, ok := rawCall.(map[string]any); ok {
+					state.appendToolChunk(call)
+				}
+			}
+			if err := state.flushPendingTools(filter, false); err != nil {
+				return writeStreamInterrupted(w, true), false
+			}
+		}
+	}
 	if err := state.flushPendingTools(filter, true); err != nil {
 		return writeStreamInterrupted(w, true), false
 	}
@@ -590,6 +732,15 @@ func chatCompletionToResponse(chat map[string]any) map[string]any {
 		}
 	}
 	output := []any{}
+	if reasoning := stringValue(message["reasoning_content"]) + stringValue(message["reasoning"]); reasoning != "" {
+		output = append(output, map[string]any{
+			"type":    "reasoning",
+			"id":      mintItemID("rs_"),
+			"status":  "completed",
+			"summary": []any{},
+			"content": []any{map[string]any{"type": "reasoning_text", "text": reasoning}},
+		})
+	}
 	if message != nil {
 		if content, _ := message["content"].(string); content != "" {
 			output = append(output, map[string]any{"type": "message", "id": mintItemID("msg_"), "status": "completed", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": content}}})

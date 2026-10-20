@@ -1,0 +1,1 @@
+{"error":{"param":null,"type":"invalid_request_error","code":"invalid_request_error","message":"Upstream request failed: [invalid_request_error] The `reasoning_content` in the thinking mode must be passed back to the API. (request_id: 16af04e4-314b-448a-b59f-533c068dbc0b)"}}
