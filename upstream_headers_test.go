@@ -65,11 +65,12 @@ func TestUpstreamSessionHeadersPaired(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var gotSession, gotSessionID, gotAffinity, gotProject, gotPath string
+			var gotSession, gotSessionID, gotSessionAlias, gotAffinity, gotProject, gotPath string
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				gotSession = r.Header.Get("x-opencode-session")
 				gotSessionID = r.Header.Get("x-opencode-session-id")
 				gotAffinity = r.Header.Get("x-session-affinity")
+				gotSessionAlias = r.Header.Get("x-session-id")
 				gotProject = r.Header.Get("x-opencode-project")
 				gotPath = r.URL.RequestURI()
 				w.Header().Set("Content-Type", "application/json")
@@ -93,8 +94,8 @@ func TestUpstreamSessionHeadersPaired(t *testing.T) {
 			if gotPath != "/inference/v1/models" {
 				t.Fatalf("upstream catalog path = %q, want /inference/v1/models", gotPath)
 			}
-			if gotSession == "" || gotSession != gotSessionID || gotSession != gotAffinity {
-				t.Fatalf("upstream session affinity headers = (%q, %q, %q), want equal non-empty values", gotSession, gotSessionID, gotAffinity)
+			if gotSession == "" || gotSession != gotSessionID || gotSession != gotAffinity || gotSession != gotSessionAlias {
+				t.Fatalf("upstream session affinity headers = (%q, %q, %q, %q), want equal non-empty values", gotSession, gotSessionID, gotAffinity, gotSessionAlias)
 			}
 			if len(gotProject) != 40 || strings.Trim(gotProject, "0123456789abcdef") != "" {
 				t.Fatalf("upstream project ID = %q, want 40 lowercase hexadecimal characters", gotProject)
@@ -116,14 +117,52 @@ func TestUpstreamAuthorizationFromGoKeyEnv(t *testing.T) {
 	tests := []struct {
 		name       string
 		goKey      string
-		wantHeader string
+		inbound    string // Authorization to send; empty = omit header
+		wantHeader string // upstream Authorization; "" = header must be absent
 	}{
-		{name: "go key overrides inbound", goKey: "sk-test-go-key", wantHeader: "Bearer sk-test-go-key"},
-		{name: "empty key forwards inbound", goKey: "", wantHeader: "Bearer inbound-key"},
+		{name: "inbound authorization wins over go key", goKey: "sk-test-env-key", inbound: "Bearer sk-test-inbound-key", wantHeader: "Bearer sk-test-inbound-key"},
+		{name: "env fallback when inbound absent", goKey: "sk-test-env-key", inbound: "", wantHeader: "Bearer sk-test-env-key"},
+		{name: "no header when both absent", goKey: "", inbound: "", wantHeader: ""},
+		{name: "blank inbound and no env key", goKey: "", inbound: " ", wantHeader: ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("OPENCODE_GO_API_KEY", tt.goKey)
+			var gotAuthorization string
+			var hadAuthorization bool
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotAuthorization = r.Header.Get("Authorization")
+				_, hadAuthorization = r.Header["Authorization"]
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"object":"list"}`)
+			}))
+			defer upstream.Close()
+
+			request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+			if tt.inbound != "" {
+				request.Header.Set("Authorization", tt.inbound)
+			}
+			recorder := httptest.NewRecorder()
+			proxyHandler(upstream.URL, upstream.Client(), &idMint{}).ServeHTTP(recorder, request)
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("client status = %d body %q", recorder.Code, recorder.Body.String())
+			}
+			if gotAuthorization != tt.wantHeader {
+				t.Fatalf("upstream Authorization = %q, want %q", gotAuthorization, tt.wantHeader)
+			}
+			if tt.wantHeader == "" && hadAuthorization {
+				t.Fatalf("upstream Authorization header present, want absent")
+			}
+		})
+	}
+}
+
+func TestUpstreamPreservesDistinctInboundAuthorization(t *testing.T) {
+	t.Setenv("OPENCODE_GO_API_KEY", "sk-test-env-key")
+	keys := []string{"Bearer sk-test-account-a", "Bearer sk-test-account-b"}
+	for _, inboundKey := range keys {
+		t.Run(inboundKey, func(t *testing.T) {
 			var gotAuthorization string
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				gotAuthorization = r.Header.Get("Authorization")
@@ -133,15 +172,15 @@ func TestUpstreamAuthorizationFromGoKeyEnv(t *testing.T) {
 			defer upstream.Close()
 
 			request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-			request.Header.Set("Authorization", "Bearer inbound-key")
+			request.Header.Set("Authorization", inboundKey)
 			recorder := httptest.NewRecorder()
 			proxyHandler(upstream.URL, upstream.Client(), &idMint{}).ServeHTTP(recorder, request)
 
 			if recorder.Code != http.StatusOK {
 				t.Fatalf("client status = %d body %q", recorder.Code, recorder.Body.String())
 			}
-			if gotAuthorization != tt.wantHeader {
-				t.Fatalf("upstream Authorization = %q, want %q", gotAuthorization, tt.wantHeader)
+			if gotAuthorization != inboundKey {
+				t.Fatalf("upstream Authorization = %q, want inbound %q unchanged", gotAuthorization, inboundKey)
 			}
 		})
 	}

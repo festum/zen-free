@@ -1,6 +1,7 @@
 FROM golang:1.23 AS build
 WORKDIR /src
 COPY go.mod *.go ./
+COPY testdata ./testdata
 ARG OPENCODE_VERSION=
 RUN set -eux; \
     V="${OPENCODE_VERSION}"; \

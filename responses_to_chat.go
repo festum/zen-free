@@ -164,6 +164,7 @@ func buildChatCompletionsRequest(responses map[string]any) map[string]any {
 	}
 	if maxTokens, ok := responses["max_output_tokens"]; ok {
 		chat["max_tokens"] = maxTokens
+		chat["max_completion_tokens"] = maxTokens
 	}
 	return chat
 }

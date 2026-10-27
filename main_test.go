@@ -3,34 +3,23 @@ package main
 import (
 	"encoding/json"
 	"os"
-	"strings"
 	"testing"
 )
 
 func TestFingerprintUAContract(t *testing.T) {
-	const suffix = " ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
-
 	if expectedVersion := os.Getenv("EXPECTED_OPENCODE_VERSION"); expectedVersion != "" {
 		if got, want := opencodeVersion, expectedVersion; got != want {
 			t.Fatalf("opencodeVersion = %q, want linker-injected %q", got, want)
 		}
+	} else if opencodeVersion != "latest/2.1.4" {
+		t.Fatalf("opencodeVersion = %q, want default %q", opencodeVersion, "latest/2.1.4")
 	}
 
-	if !strings.HasPrefix(fingerprintUA, "opencode/") {
-		t.Fatalf("fingerprintUA = %q, want prefix opencode/", fingerprintUA)
-	}
-
-	version := strings.TrimPrefix(fingerprintUA, "opencode/")
-	version, _, _ = strings.Cut(version, " ")
-	if version == "" {
-		t.Fatal("fingerprintUA has an empty opencode version")
-	}
-
-	if !strings.HasSuffix(fingerprintUA, suffix) {
-		t.Fatalf("fingerprintUA = %q, want suffix %q", fingerprintUA, suffix)
-	}
-	if got, want := fingerprintUA, "opencode/"+opencodeVersion+suffix; got != want {
+	if got, want := fingerprintUA, "opencode/"+opencodeVersion+"/cli"; got != want {
 		t.Fatalf("fingerprintUA = %q, want %q", got, want)
+	}
+	if got, want := buildFingerprintUA(), fingerprintUA; got != want {
+		t.Fatalf("buildFingerprintUA() = %q, want %q", got, want)
 	}
 }
 
@@ -41,7 +30,7 @@ func TestBuildFingerprintUAUsesOpencodeVersion(t *testing.T) {
 	})
 
 	opencodeVersion = "9.9.9"
-	const expected = "opencode/9.9.9 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+	const expected = "opencode/9.9.9/cli"
 	if got := buildFingerprintUA(); got != expected {
 		t.Fatalf("buildFingerprintUA() = %q, want %q", got, expected)
 	}
@@ -143,7 +132,8 @@ func TestNormalizeCapturedCoreToolsPreservesCallerTools(t *testing.T) {
 				filter = augmentFlatTools(body, true)
 			}
 			got := array(t, body["tools"])
-			wantNames := []string{"lookup", "bash", "write", "glob", "grep", "read"}
+			wantNames := []string{"edit", "glob", "grep", "read", "write", "lookup", "bash"}
+			wantHidden := map[string]bool{"edit": true, "glob": true, "grep": true, "read": true}
 			if len(got) != len(wantNames) {
 				t.Fatalf("normalized tools count = %d, want %d", len(got), len(wantNames))
 			}
@@ -155,62 +145,66 @@ func TestNormalizeCapturedCoreToolsPreservesCallerTools(t *testing.T) {
 				if tool["name"] != wantNames[i] {
 					t.Errorf("tool %d name = %#v, want %q", i, tool["name"], wantNames[i])
 				}
-				if wantNames[i] != "lookup" {
-					for _, captured := range capturedOpenCodeTools {
-						function := object(t, object(t, captured)["function"])
-						if function["name"] != wantNames[i] {
-							continue
-						}
-						want, err := json.Marshal(function)
-						if err != nil {
-							t.Fatal(err)
-						}
-						gotSchemaValue := tool
-						if !nested {
-							gotSchemaValue = make(map[string]any, len(tool)-1)
-							for key, value := range tool {
-								if key != "type" {
-									gotSchemaValue[key] = value
-								}
-							}
-						}
-						gotSchema, err := json.Marshal(gotSchemaValue)
-						if err != nil {
-							t.Fatal(err)
-						}
-						if string(gotSchema) != string(want) {
-							t.Errorf("tool %q does not match captured definition", wantNames[i])
-						}
+				assertWiredToolSchema(t, value, wantNames[i], nested)
+				if filter[wantNames[i]] != wantHidden[wantNames[i]] {
+					t.Errorf("tool %q hidden = %t, want %t", wantNames[i], filter[wantNames[i]], wantHidden[wantNames[i]])
+				}
+			}
+
+			cases := []struct {
+				name       string
+				callers    []string
+				normalize  bool
+				wantNames  []string
+				wantHidden []string
+			}{
+				{
+					name:       "absent",
+					normalize:  true,
+					wantNames:  []string{"edit", "glob", "grep", "read", "write", "bash"},
+					wantHidden: []string{"bash", "edit", "glob", "grep", "read", "write"},
+				},
+				{
+					name:       "empty",
+					callers:    []string{},
+					normalize:  true,
+					wantNames:  []string{"edit", "glob", "grep", "read", "write", "bash"},
+					wantHidden: []string{"bash", "edit", "glob", "grep", "read", "write"},
+				},
+				{
+					name:       "complete required",
+					callers:    []string{"bash", "glob", "grep", "read"},
+					normalize:  true,
+					wantNames:  []string{"edit", "glob", "grep", "read", "write", "bash"},
+					wantHidden: []string{"edit", "write"},
+				},
+				{
+					name:      "outside inference",
+					callers:   []string{"bash", "lookup"},
+					wantNames: []string{"bash", "lookup"},
+				},
+			}
+			for _, core := range []string{"bash", "edit", "glob", "grep", "read", "write"} {
+				hidden := []string{"bash", "edit", "glob", "grep", "read", "write"}
+				for i, candidate := range hidden {
+					if candidate == core {
+						hidden = append(hidden[:i], hidden[i+1:]...)
+						break
 					}
 				}
-			}
-			for _, core := range []string{"glob", "grep", "read"} {
-				if !filter[core] {
-					t.Errorf("filter does not hide appended tool %q", core)
-				}
-			}
-			for _, caller := range []string{"bash", "write", "lookup"} {
-				if filter[caller] {
-					t.Errorf("filter hides caller tool %q", caller)
-				}
-			}
-			cases := []struct {
-				name      string
-				callers   []string
-				normalize bool
-			}{
-				{name: "absent", normalize: true},
-				{name: "empty", callers: []string{}, normalize: true},
-				{name: "complete required", callers: []string{"bash", "glob", "grep", "read"}, normalize: true},
-				{name: "outside inference", callers: []string{"bash", "lookup"}},
-			}
-			for _, raw := range capturedOpenCodeTools {
-				core := toolName(object(t, raw))
 				cases = append(cases, struct {
-					name      string
-					callers   []string
-					normalize bool
-				}{name: "caller " + core, callers: []string{core}, normalize: true})
+					name       string
+					callers    []string
+					normalize  bool
+					wantNames  []string
+					wantHidden []string
+				}{
+					name:       "caller " + core,
+					callers:    []string{core},
+					normalize:  true,
+					wantNames:  []string{"edit", "glob", "grep", "read", "write", "bash"},
+					wantHidden: hidden,
+				})
 			}
 			for _, tc := range cases {
 				t.Run(tc.name, func(t *testing.T) {
@@ -237,30 +231,31 @@ func TestNormalizeCapturedCoreToolsPreservesCallerTools(t *testing.T) {
 						return
 					}
 					got := array(t, body["tools"])
-					wantNames := append([]string{}, tc.callers...)
-					if len(tc.callers) == 0 {
-						wantNames = []string{"bash", "edit", "glob", "grep", "read", "write"}
-					} else {
-						for _, required := range []string{"bash", "glob", "grep", "read"} {
-							present := false
-							for _, caller := range tc.callers {
-								present = present || caller == required
-							}
-							if !present {
-								wantNames = append(wantNames, required)
-							}
-						}
+					wantHidden := make(map[string]bool, len(tc.wantHidden))
+					for _, hidden := range tc.wantHidden {
+						wantHidden[hidden] = true
 					}
-					if len(got) != len(wantNames) || len(filter) != len(wantNames)-len(tc.callers) {
-						t.Fatalf("tools=%#v filter=%v, want names=%v and %d hidden", got, filter, wantNames, len(wantNames)-len(tc.callers))
+					if len(got) != len(tc.wantNames) {
+						t.Fatalf("tools=%#v filter=%v, want names=%v", got, filter, tc.wantNames)
 					}
-					for i, wantName := range wantNames {
-						tool := object(t, got[i])
-						want, _ := json.Marshal(capturedTool(wantName, nested))
-						actual, _ := json.Marshal(tool)
-						if toolName(tool) != wantName || string(actual) != string(want) || filter[wantName] != (i >= len(tc.callers)) {
-							t.Errorf("tool[%d]=%s hidden=%t, want %s hidden=%t", i, actual, filter[wantName], want, i >= len(tc.callers))
+					for i, wantName := range tc.wantNames {
+						value := got[i]
+						tool := object(t, value)
+						if toolName(tool) != wantName {
+							t.Errorf("tool[%d] = %q, want %q", i, toolName(tool), wantName)
 						}
+						if filter[wantName] != wantHidden[wantName] {
+							t.Errorf("tool %q hidden = %t, want %t", wantName, filter[wantName], wantHidden[wantName])
+						}
+						if wantName != "bash" && !containsManifestName(wantName) {
+							want, _ := json.Marshal(callerTool(callerTools, wantName))
+							actual, _ := json.Marshal(value)
+							if string(actual) != string(want) {
+								t.Errorf("caller tool %q = %s, want %s", wantName, actual, want)
+							}
+							continue
+						}
+						assertWiredToolSchema(t, value, wantName, nested)
 					}
 				})
 			}

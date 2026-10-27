@@ -23,7 +23,7 @@ import (
 
 const base62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-var opencodeVersion = "1.18.35"
+var opencodeVersion = "latest/2.1.4"
 var opencodeProjectID = mintProjectID()
 
 var fingerprintUA = buildFingerprintUA()
@@ -36,7 +36,29 @@ func mintProjectID() string {
 	return hex.EncodeToString(value[:])
 }
 func buildFingerprintUA() string {
-	return "opencode/" + opencodeVersion + " ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+	return "opencode/" + opencodeVersion + "/cli"
+}
+
+var traceRootID = randomTraceID()
+
+func randomTraceID() string {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		panic(fmt.Errorf("generate trace root: %w", err))
+	}
+	return hex.EncodeToString(value[:])
+}
+
+func traceContextHeaders() (string, string) {
+	var span, parent [8]byte
+	if _, err := rand.Read(span[:]); err != nil {
+		panic(fmt.Errorf("generate trace span: %w", err))
+	}
+	if _, err := rand.Read(parent[:]); err != nil {
+		panic(fmt.Errorf("generate trace parent: %w", err))
+	}
+	spanID, parentID := hex.EncodeToString(span[:]), hex.EncodeToString(parent[:])
+	return traceRootID + "-" + spanID + "-1-" + parentID, "00-" + traceRootID + "-" + spanID + "-01"
 }
 
 type contextKey struct{}
@@ -161,7 +183,7 @@ func capturedTool(name string, nested bool) map[string]any {
 
 func augmentTools(body map[string]any, nested, normalize bool) map[string]bool {
 	tools, _ := body["tools"].([]any)
-	if !normalize || len(tools) == 0 {
+	if !normalize {
 		if len(tools) > 0 {
 			return nil
 		}
@@ -184,32 +206,48 @@ func augmentTools(body map[string]any, nested, normalize bool) map[string]bool {
 		return injected
 	}
 
-	coreNames := make(map[string]bool, len(capturedOpenCodeTools))
-	for _, raw := range capturedOpenCodeTools {
-		coreNames[toolName(raw.(map[string]any))] = true
+	callerNames := make(map[string]bool, len(tools))
+	for _, raw := range tools {
+		if tool, ok := raw.(map[string]any); ok {
+			callerNames[toolName(tool)] = true
+		}
 	}
-	filter := make(map[string]bool, len(coreNames))
-	seenRequired := make(map[string]bool, 4)
-	for i, raw := range tools {
+	bridgedNames := make(map[string]bool, len(bridgedManifestTools))
+	wired := make([]any, 0, len(bridgedManifestTools)+len(tools)+1)
+	filter := make(map[string]bool, len(bridgedManifestTools)+1)
+	for _, raw := range bridgedManifestTools {
+		tool := wireTool(raw, nested)
+		name := toolName(tool)
+		wired = append(wired, tool)
+		bridgedNames[name] = true
+		if !callerNames[name] {
+			filter[name] = true
+		}
+	}
+	coreNames := capturedCoreToolNames()
+	for _, raw := range tools {
 		tool, ok := raw.(map[string]any)
 		if !ok {
+			wired = append(wired, raw)
 			continue
 		}
 		name := toolName(tool)
-		if !coreNames[name] {
-			continue
+		switch {
+		case bridgedNames[name]:
+		case coreNames[name]:
+			wired = append(wired, capturedTool(name, nested))
+		default:
+			wired = append(wired, raw)
 		}
-		tools[i] = capturedTool(name, nested)
-		seenRequired[name] = true
 	}
 	for _, name := range []string{"bash", "glob", "grep", "read"} {
-		if seenRequired[name] {
+		if callerNames[name] || bridgedNames[name] {
 			continue
 		}
-		tools = append(tools, capturedTool(name, nested))
+		wired = append(wired, capturedTool(name, nested))
 		filter[name] = true
 	}
-	body["tools"] = tools
+	body["tools"] = wired
 	return filter
 }
 
@@ -223,18 +261,38 @@ func augmentFlatTools(body map[string]any, normalize bool) map[string]bool {
 
 type toolCallFilter struct {
 	injected map[string]bool
+	offered  map[string]bool
 }
 
 func (f toolCallFilter) hides(name string) bool {
+	if f.offered != nil {
+		return !f.offered[name]
+	}
 	return f.injected[name]
 }
 
 func (f toolCallFilter) enabled() bool {
-	return len(f.injected) > 0
+	return len(f.injected) > 0 || f.offered != nil
 }
 
-func requestToolFilter(injected map[string]bool) toolCallFilter {
-	return toolCallFilter{injected: injected}
+func requestToolFilter(injected, offered map[string]bool) toolCallFilter {
+	return toolCallFilter{injected: injected, offered: offered}
+}
+
+func offeredToolNames(callerTools []any) map[string]bool {
+	if len(callerTools) == 0 {
+		return nil
+	}
+	names := make(map[string]bool, len(callerTools))
+	for _, raw := range callerTools {
+		if tool, ok := raw.(map[string]any); ok {
+			names[toolName(tool)] = true
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	return names
 }
 
 func setRequestBody(req *http.Request, body []byte) {
@@ -404,8 +462,16 @@ func proxyHandlerWithRelay(upstream string, client *http.Client, mint *idMint, r
 				if forcedStream {
 					requestBody["stream"] = true
 				}
+				callerTools, _ := requestBody["tools"].([]any)
+				if inference {
+					injectAgentPreamble(requestBody)
+				}
 				injectedTools = augmentFlatTools(requestBody, inference)
-				toolFilter = requestToolFilter(injectedTools)
+				var offered map[string]bool
+				if inference {
+					offered = offeredToolNames(callerTools)
+				}
+				toolFilter = requestToolFilter(injectedTools, offered)
 				nativeResponsesBody := original
 				if forcedStream || inference || len(injectedTools) > 0 {
 					updated, marshalErr := json.Marshal(requestBody)
@@ -420,6 +486,9 @@ func proxyHandlerWithRelay(upstream string, client *http.Client, mint *idMint, r
 				if !isMuseModel(requestedModel) {
 					chatBody := buildChatCompletionsRequest(requestBody)
 					chatBody["stream"] = true
+					if inference {
+						applyChatStreamWireDefaults(chatBody)
+					}
 					converted, marshalErr := json.Marshal(chatBody)
 					if marshalErr != nil {
 						http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -434,8 +503,15 @@ func proxyHandlerWithRelay(upstream string, client *http.Client, mint *idMint, r
 		case strings.Contains(r.URL.Path, "/v1/chat/completions") && isMuseModel(requestedModel):
 			museChat = true
 			callerTools, _ := requestBody["tools"].([]any)
+			if inference {
+				injectAgentPreamble(requestBody)
+			}
 			injectedTools = augmentChatTools(requestBody, inference)
-			toolFilter = requestToolFilter(injectedTools)
+			var offered map[string]bool
+			if inference {
+				offered = offeredToolNames(callerTools)
+			}
+			toolFilter = requestToolFilter(injectedTools, offered)
 			if len(callerTools) == 0 {
 				if _, choiceProvided := requestBody["tool_choice"]; !choiceProvided {
 					requestBody["tool_choice"] = "none"
@@ -457,16 +533,26 @@ func proxyHandlerWithRelay(upstream string, client *http.Client, mint *idMint, r
 		default:
 			if decoded {
 				callerTools, _ := requestBody["tools"].([]any)
+				if inference {
+					injectAgentPreamble(requestBody)
+				}
 				injectedTools = augmentChatTools(requestBody, inference)
 				if strings.Contains(r.URL.Path, "/v1/chat/completions") && len(callerTools) == 0 {
 					if _, choiceProvided := requestBody["tool_choice"]; !choiceProvided {
 						requestBody["tool_choice"] = "none"
 					}
 				}
-				toolFilter = requestToolFilter(injectedTools)
+				var offered map[string]bool
+				if inference {
+					offered = offeredToolNames(callerTools)
+				}
+				toolFilter = requestToolFilter(injectedTools, offered)
 				if strings.Contains(r.URL.Path, "/v1/chat/completions") {
 					chatWire = true
 					requestBody["stream"] = true
+					if inference {
+						applyChatStreamWireDefaults(requestBody)
+					}
 				}
 				if len(injectedTools) > 0 || chatWire || inference {
 					updated, marshalErr := json.Marshal(requestBody)
@@ -515,13 +601,20 @@ func proxyHandlerWithRelay(upstream string, client *http.Client, mint *idMint, r
 			headers.Del("x-relay-path")
 		}
 		headers.Set("User-Agent", fingerprintUA)
-		headers.Set("x-opencode-client", "desktop")
+		headers.Set("x-opencode-client", "cli")
 		headers.Set("x-opencode-project", opencodeProjectID)
 		headers.Set("x-opencode-session", session)
 		headers.Set("x-opencode-session-id", session)
 		headers.Set("x-session-affinity", session)
-		if apiKey != "" {
-			headers.Set("Authorization", "Bearer "+apiKey)
+		headers.Set("x-session-id", session)
+		b3Header, traceparentHeader := traceContextHeaders()
+		headers.Set("b3", b3Header)
+		headers.Set("traceparent", traceparentHeader)
+		if strings.TrimSpace(headers.Get("Authorization")) == "" {
+			headers.Del("Authorization")
+			if apiKey != "" {
+				headers.Set("Authorization", "Bearer "+apiKey)
+			}
 		}
 		headers.Set("x-opencode-request", requestID)
 		headers.Set("Accept-Encoding", "identity")
@@ -726,6 +819,7 @@ func proxyHandlerWithRelay(upstream string, client *http.Client, mint *idMint, r
 					stripChatCompletionToolCalls(completion, toolFilter)
 				}
 				_ = json.NewEncoder(w).Encode(chatCompletionToResponse(completion))
+				status = http.StatusOK
 				return
 			}
 			if chatWire && !clientStream && isSSE && resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -747,6 +841,7 @@ func proxyHandlerWithRelay(upstream string, client *http.Client, mint *idMint, r
 					stripChatCompletionToolCalls(completion, toolFilter)
 				}
 				_ = json.NewEncoder(w).Encode(completion)
+				status = http.StatusOK
 				return
 			}
 			if responsesWire && !clientStream && isSSE && resp.StatusCode >= 200 && resp.StatusCode < 300 {

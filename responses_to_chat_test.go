@@ -639,7 +639,7 @@ func TestProxyHandlerResponsesProtocolFallback(t *testing.T) {
 	}
 	wantChatTools := []any{map[string]any{"type": "function", "function": map[string]any{"name": "lookup", "parameters": map[string]any{"type": "object"}}}}
 	wantNativeTools := []any{map[string]any{"type": "function", "name": "lookup", "parameters": map[string]any{"type": "object"}}}
-	if !reflect.DeepEqual(chatBody["tools"].([]any)[:1], wantChatTools) || !reflect.DeepEqual(nativeBody["tools"].([]any)[:1], wantNativeTools) {
+	if !reflect.DeepEqual(findToolByName(t, chatBody["tools"], "lookup", true), wantChatTools[0]) || !reflect.DeepEqual(findToolByName(t, nativeBody["tools"], "lookup", false), wantNativeTools[0]) {
 		t.Fatalf("caller tools changed across fallback: chat=%#v native=%#v", chatBody["tools"], nativeBody["tools"])
 	}
 	assertHasNestedToolNames(t, chatBody["tools"], "lookup")
@@ -745,21 +745,39 @@ func TestProxyHandlerPreservesNormalizedSchemasWithoutInjectedTools(t *testing.T
 					t.Errorf("upstream request lost explicit choice or streaming: %#v", upstreamBody)
 				}
 				got := array(t, upstreamBody["tools"])
-				if len(got) != 4 {
-					t.Fatalf("complete caller tools changed count: %#v", got)
+				if len(got) != 6 {
+					t.Fatalf("v2 tool list count = %d, want 6 (5 bridged manifest + bash): %#v", len(got), got)
 				}
 				nested := strings.HasSuffix(paths[i], "/v1/chat/completions") || mode == "default non-Chat inference"
-				for j, name := range []string{"bash", "glob", "grep", "read"} {
-					actual, err := json.Marshal(got[j])
-					if err != nil {
-						t.Fatal(err)
+				wantOrder := []string{"edit", "glob", "grep", "read", "write", "bash"}
+				for j, raw := range got {
+					tool := object(t, raw)
+					probe := tool
+					if nested {
+						probe = object(t, tool["function"])
 					}
-					want, err := json.Marshal(capturedTool(name, nested))
-					if err != nil {
-						t.Fatal(err)
+					if name := stringValue(probe["name"]); name != wantOrder[j] {
+						t.Fatalf("%s tool[%d] = %s, want %s", paths[i], j, name, wantOrder[j])
 					}
-					if string(actual) != string(want) {
-						t.Errorf("%s tool[%d]=%s, want captured %s schema", paths[i], j, actual, name)
+					var canonicalFlat any
+					if j < len(bridgedManifestTools) {
+						canonicalFlat = wireTool(bridgedManifestTools[j], false)
+					} else {
+						canonicalFlat = capturedTool("bash", false)
+					}
+					wantTool := object(t, canonicalFlat)
+					for _, field := range []string{"description", "parameters"} {
+						gotJSON, err := json.Marshal(probe[field])
+						if err != nil {
+							t.Fatal(err)
+						}
+						wantJSON, err := json.Marshal(wantTool[field])
+						if err != nil {
+							t.Fatal(err)
+						}
+						if string(gotJSON) != string(wantJSON) {
+							t.Errorf("%s tool[%d] %s=%s, want canonical %s %s", paths[i], j, field, gotJSON, wantOrder[j], field)
+						}
 					}
 				}
 			}
@@ -856,14 +874,18 @@ func TestProxyHandlerResponsesToolRoundTrip(t *testing.T) {
 	}
 	messages := array(t, upstreamBody["messages"])
 	mu.Unlock()
-	if len(messages) != 3 {
-		t.Fatalf("upstream messages = %#v, want user + assistant(tool_calls) + tool", messages)
+	if len(messages) != 4 {
+		t.Fatalf("upstream messages = %#v, want system(preamble) + user + assistant(tool_calls) + tool", messages)
 	}
-	user := object(t, messages[0])
+	system := object(t, messages[0])
+	if system["role"] != "system" || !strings.HasPrefix(stringValue(system["content"]), preambleMarker) {
+		t.Fatalf("system = %#v", system)
+	}
+	user := object(t, messages[1])
 	if user["role"] != "user" {
 		t.Fatalf("user = %#v", user)
 	}
-	assistant := object(t, messages[1])
+	assistant := object(t, messages[2])
 	if assistant["role"] != "assistant" {
 		t.Fatalf("assistant = %#v", assistant)
 	}
@@ -873,7 +895,7 @@ func TestProxyHandlerResponsesToolRoundTrip(t *testing.T) {
 	if call["id"] != "call-1" || function["name"] != "lookup" || function["arguments"] != `{"city":"Paris"}` {
 		t.Fatalf("assistant call = %#v", call)
 	}
-	toolReply := object(t, messages[2])
+	toolReply := object(t, messages[3])
 	if toolReply["role"] != "tool" || toolReply["tool_call_id"] != "call-1" || toolReply["content"] != "sunny" {
 		t.Fatalf("tool reply = %#v", toolReply)
 	}
@@ -1423,8 +1445,8 @@ func TestDeepSeekReasoningHTTPToolReplay(t *testing.T) {
 						result = message
 					}
 				}
-				if len(messages) == 1 {
-					user, _ := messages[0].(map[string]any)
+				if len(messages) == 2 {
+					user, _ := messages[1].(map[string]any)
 					if user["role"] != "user" || user["content"] != initialText {
 						t.Errorf("first-turn history = %#v", messages)
 					}
@@ -1446,7 +1468,7 @@ func TestDeepSeekReasoningHTTPToolReplay(t *testing.T) {
 					_, _ = io.WriteString(w, "data: {\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6,\"total_tokens\":10,\"completion_tokens_details\":{\"reasoning_tokens\":5}}}\n\ndata: [DONE]\n\n")
 					return
 				}
-				wantCount := 3
+				wantCount := 4
 				if mode.tool {
 					wantCount++
 				}
@@ -1456,16 +1478,16 @@ func TestDeepSeekReasoningHTTPToolReplay(t *testing.T) {
 					return
 				}
 				calls, _ := assistant["tool_calls"].([]any)
-				user, _ := messages[0].(map[string]any)
+				user, _ := messages[1].(map[string]any)
 				followup, _ := messages[len(messages)-1].(map[string]any)
-				valid := reflect.DeepEqual(messages[1], assistant) && user["role"] == "user" && user["content"] == initialText && assistant["role"] == "assistant" && followup["role"] == "user" && followup["content"] == followupText
+				valid := reflect.DeepEqual(messages[2], assistant) && user["role"] == "user" && user["content"] == initialText && assistant["role"] == "assistant" && followup["role"] == "user" && followup["content"] == followupText
 				if mode.content == "" {
 					valid = valid && assistant["content"] == ""
 				} else {
 					valid = valid && reflect.DeepEqual(assistant["content"], []any{map[string]any{"type": "text", "text": mode.content}})
 				}
 				if mode.tool {
-					valid = valid && len(calls) == 1 && reflect.DeepEqual(messages[2], result) && result["role"] == "tool" && result["tool_call_id"] == "actual-call-雪" && result["content"] == "5461"
+					valid = valid && len(calls) == 1 && reflect.DeepEqual(messages[3], result) && result["role"] == "tool" && result["tool_call_id"] == "actual-call-雪" && result["content"] == "5461"
 				} else {
 					valid = valid && len(calls) == 0 && result == nil
 				}

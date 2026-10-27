@@ -292,12 +292,12 @@ func TestProxyHandlerInferenceNormalizationPreservesWireFormats(t *testing.T) {
 		wantNames    []string
 		wantChoice   any
 	}{
-		{name: "inference OpenAI Chat", upstreamPath: "/inference", path: "/v1/chat/completions?trace=chat%2F1", wantURI: "/inference/openai/v1/chat/completions?trace=chat%2F1", body: `{"model":"gpt-4o","messages":[],"tool_choice":"required","tools":[{"type":"function","function":{"name":"bash","parameters":{"type":"string"}}},{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`, wantNested: true, wantNames: []string{"bash", "lookup", "glob", "grep", "read"}, wantChoice: "required"},
-		{name: "inference Muse Chat", upstreamPath: "/inference", path: "/v1/chat/completions?trace=muse%2Fchat", wantURI: "/inference/openai/v1/responses?trace=muse%2Fchat", body: `{"model":"muse-spark-1.3","messages":[{"role":"user","content":"hi"}],"tool_choice":"required","tools":[{"type":"function","function":{"name":"bash","parameters":{"type":"string"}}}]}`, wantNames: []string{"bash", "glob", "grep", "read"}, wantChoice: "required"},
-		{name: "inference Muse Responses", upstreamPath: "/inference", path: "/v1/responses?trace=muse%2Fresponses", wantURI: "/inference/openai/v1/responses?trace=muse%2Fresponses", body: `{"model":"muse-spark-1.3","input":"hi","tools":[{"type":"function","name":"bash","parameters":{"type":"string"}},{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":"required"}`, wantNames: []string{"bash", "lookup", "glob", "grep", "read"}, wantChoice: "required"},
-		{name: "exact inference OpenAI family", upstreamPath: "/inference/openai", path: "/v1/chat/completions?trace=exact%2Ffamily", wantURI: "/inference/openai/v1/chat/completions?trace=exact%2Ffamily", body: `{"model":"gpt-4o","messages":[],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`, wantNested: true, wantNames: []string{"lookup", "bash", "glob", "grep", "read"}},
-		{name: "inference Anthropic Responses", upstreamPath: "/inference/anthropic", path: "/v1/responses", wantURI: "/inference/anthropic/v1/responses", body: `{"model":"muse-spark-1.3","input":"hi","tools":[{"type":"function","name":"bash","parameters":{"type":"string"}},{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":"required"}`, wantNames: []string{"bash", "lookup", "glob", "grep", "read"}, wantChoice: "required"},
-		{name: "inference Google Chat", upstreamPath: "/inference/google", path: "/v1/chat/completions", wantURI: "/inference/google/v1/chat/completions", body: `{"model":"gpt-4o","messages":[],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`, wantNested: true, wantNames: []string{"lookup", "bash", "glob", "grep", "read"}},
+		{name: "inference OpenAI Chat", upstreamPath: "/inference", path: "/v1/chat/completions?trace=chat%2F1", wantURI: "/inference/openai/v1/chat/completions?trace=chat%2F1", body: `{"model":"gpt-4o","messages":[],"tool_choice":"required","tools":[{"type":"function","function":{"name":"bash","parameters":{"type":"string"}}},{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`, wantNested: true, wantNames: []string{"edit", "glob", "grep", "read", "write", "bash", "lookup"}, wantChoice: "required"},
+		{name: "inference Muse Chat", upstreamPath: "/inference", path: "/v1/chat/completions?trace=muse%2Fchat", wantURI: "/inference/openai/v1/responses?trace=muse%2Fchat", body: `{"model":"muse-spark-1.3","messages":[{"role":"user","content":"hi"}],"tool_choice":"required","tools":[{"type":"function","function":{"name":"bash","parameters":{"type":"string"}}}]}`, wantNames: []string{"edit", "glob", "grep", "read", "write", "bash"}, wantChoice: "required"},
+		{name: "inference Muse Responses", upstreamPath: "/inference", path: "/v1/responses?trace=muse%2Fresponses", wantURI: "/inference/openai/v1/responses?trace=muse%2Fresponses", body: `{"model":"muse-spark-1.3","input":"hi","tools":[{"type":"function","name":"bash","parameters":{"type":"string"}},{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":"required"}`, wantNames: []string{"edit", "glob", "grep", "read", "write", "bash", "lookup"}, wantChoice: "required"},
+		{name: "exact inference OpenAI family", upstreamPath: "/inference/openai", path: "/v1/chat/completions?trace=exact%2Ffamily", wantURI: "/inference/openai/v1/chat/completions?trace=exact%2Ffamily", body: `{"model":"gpt-4o","messages":[],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`, wantNested: true, wantNames: []string{"edit", "glob", "grep", "read", "write", "lookup", "bash"}},
+		{name: "inference Anthropic Responses", upstreamPath: "/inference/anthropic", path: "/v1/responses", wantURI: "/inference/anthropic/v1/responses", body: `{"model":"muse-spark-1.3","input":"hi","tools":[{"type":"function","name":"bash","parameters":{"type":"string"}},{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":"required"}`, wantNames: []string{"edit", "glob", "grep", "read", "write", "bash", "lookup"}, wantChoice: "required"},
+		{name: "inference Google Chat", upstreamPath: "/inference/google", path: "/v1/chat/completions", wantURI: "/inference/google/v1/chat/completions", body: `{"model":"gpt-4o","messages":[],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`, wantNested: true, wantNames: []string{"edit", "glob", "grep", "read", "write", "lookup", "bash"}},
 		{name: "unrelated legacy path keeps client tools", upstreamPath: "/zen/v1", path: "/chat/completions", wantURI: "/zen/v1/chat/completions", body: `{"model":"gpt-4o","messages":[],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`, wantNested: true, wantNames: []string{"lookup"}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1165,6 +1165,81 @@ func TestFilterToolCallsInJSON(t *testing.T) {
 	}
 }
 
+func TestFilterToolCallsInJSONKeepable(t *testing.T) {
+	keep := toolCallFilter{offered: map[string]bool{"lookup": true}}
+	if !keep.enabled() {
+		t.Fatal("offered filter should be enabled")
+	}
+	chat := []byte(`{"choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[{"function":{"name":"lookup"}},{"function":{"name":"mystery"}}]}}]}`)
+	filtered, changed := filterToolCallsInJSON(chat, keep)
+	if !changed {
+		t.Fatal("chat response was not filtered")
+	}
+	choice := object(t, array(t, decodeJSON(t, filtered)["choices"])[0])
+	calls := array(t, object(t, choice["message"])["tool_calls"])
+	if len(calls) != 1 || stringValue(object(t, object(t, calls[0])["function"])["name"]) != "lookup" {
+		t.Fatalf("keepable chat output = %#v", choice)
+	}
+
+	responses := []byte(`{"output":[{"type":"function_call","name":"lookup"},{"type":"function_call","name":"mystery"},{"type":"message","content":[]}]}`)
+	filtered, changed = filterToolCallsInJSON(responses, keep)
+	if !changed {
+		t.Fatal("Responses payload was not filtered")
+	}
+	output := array(t, decodeJSON(t, filtered)["output"])
+	if len(output) != 2 || object(t, output[0])["name"] != "lookup" || object(t, output[1])["type"] != "message" {
+		t.Fatalf("keepable Responses output = %#v", output)
+	}
+
+	legacy := toolCallFilter{injected: map[string]bool{"read": true}}
+	if legacy.hides("mystery") || !legacy.hides("read") {
+		t.Fatalf("legacy hides(mystery)=%v hides(read)=%v, want false/true", legacy.hides("mystery"), legacy.hides("read"))
+	}
+
+	var empty toolCallFilter
+	if empty.enabled() {
+		t.Fatal("empty filter should be disabled")
+	}
+	if out, changed := filterToolCallsInJSON(chat, empty); changed || string(out) != string(chat) {
+		t.Fatalf("empty filter changed payload: changed=%v", changed)
+	}
+}
+
+func TestProxyHandlerDropsNonOfferedReplyTools(t *testing.T) {
+	setStabilityTestKnobs(t)
+	t.Setenv("ZEN_RELAY_URL", "")
+	t.Setenv("OPENCODE_GO_API_KEY", "")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-1","object":"chat.completion","model":"gpt-4o","choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_lookup","type":"function","function":{"name":"lookup","arguments":"{}"}},{"id":"call_mystery","type":"function","function":{"name":"mystery","arguments":"{}"}}]}}]}`)
+	}))
+	defer upstream.Close()
+	body := map[string]any{
+		"model":    "gpt-4o",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		"tools": []any{
+			map[string]any{"type": "function", "function": map[string]any{"name": "bash", "parameters": map[string]any{"type": "string"}}},
+			map[string]any{"type": "function", "function": map[string]any{"name": "lookup", "parameters": map[string]any{"type": "object"}}},
+		},
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(encoded))
+	request.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	proxyHandler(upstream.URL+"/inference/openai", upstream.Client(), &idMint{}).ServeHTTP(w, request)
+	if w.Code != http.StatusOK {
+		t.Fatalf("proxy response = %d %q", w.Code, w.Body.String())
+	}
+	choice := object(t, array(t, decodeJSON(t, w.Body.Bytes())["choices"])[0])
+	calls := array(t, object(t, choice["message"])["tool_calls"])
+	if len(calls) != 1 || stringValue(object(t, object(t, calls[0])["function"])["name"]) != "lookup" {
+		t.Fatalf("reply tool_calls = %#v, want only offered lookup", calls)
+	}
+}
+
 func assertOnlyFlatTool(t *testing.T, value any, wantName string) {
 	t.Helper()
 	tools := array(t, value)
@@ -1220,4 +1295,19 @@ func assertToolNames(t *testing.T, value any, nested bool, want []string) {
 			t.Fatalf("tools = %#v, missing %q", tools, name)
 		}
 	}
+}
+
+func findToolByName(t *testing.T, value any, name string, nested bool) map[string]any {
+	t.Helper()
+	for _, raw := range array(t, value) {
+		tool := object(t, raw)
+		probe := tool
+		if nested {
+			probe = object(t, tool["function"])
+		}
+		if stringValue(probe["name"]) == name {
+			return tool
+		}
+	}
+	return nil
 }
