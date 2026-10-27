@@ -1,7 +1,8 @@
-FROM golang:1.23 AS build
+FROM --platform=$BUILDPLATFORM golang:1.23 AS build
 WORKDIR /src
 COPY go.mod *.go ./
 COPY testdata ./testdata
+ARG TARGETARCH
 ARG OPENCODE_VERSION=
 RUN set -eux; \
     V="${OPENCODE_VERSION}"; \
@@ -12,7 +13,7 @@ RUN set -eux; \
     LD="-s -w"; \
     if [ -n "$V" ]; then LD="$LD -X main.opencodeVersion=$V"; fi; \
     echo "opencode fingerprint version: ${V:-source default}"; \
-    CGO_ENABLED=0 go build -trimpath -ldflags="$LD" -o /out/oc-zen .; \
+    CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -trimpath -ldflags="$LD" -o /out/oc-zen .; \
     if [ -n "$V" ]; then grep -aqF "$V" /out/oc-zen; fi
 
 FROM scratch
